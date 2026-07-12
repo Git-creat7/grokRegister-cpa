@@ -232,6 +232,16 @@ curl -H "Authorization: Bearer <管理密钥>" \
   http://你的CPA地址:8317/v0/management/auth-files
 ```
 
+`cpa_remote_url` 填 CPA 实例根地址，不要附带 OpenAI 兼容接口的 `/v1`。程序会自动追加 `/v0/management/auth-files`。
+
+**创建 Cloudflare 邮箱时 curl 超时**
+
+如果当前网络需要代理访问 `workers.dev`，请在 GUI 的“代理”字段或 `config.json` 的 `proxy` 中显式填写代理地址。不要只依赖终端的 `HTTP_PROXY` / `HTTPS_PROXY`，从桌面启动 GUI 时可能不会继承这些环境变量。
+
+**开启 NSFW 时返回 403**
+
+设置出生日期可能被 `grok.com` 的 Cloudflare 防护拦截。该步骤失败不会影响账号保存和 CPA 入库；不需要敏感内容时可关闭“注册后开启 NSFW”。
+
 **CLI 为什么还开浏览器**  
 CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
 
