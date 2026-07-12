@@ -5,7 +5,7 @@ cssselect==1.3.0
 curl_cffi==0.13.0
 DataRecorder==3.6.2
 DownloadKit==2.0.7
-DrissionPage==4.1.1.2
+DrissionPage==4.1.1.4
 filelock==3.19.1
 idna==3.13
 lxml==6.1.0

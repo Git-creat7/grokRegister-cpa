@@ -1,3 +1,4 @@
+import tkinter as tk
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +19,9 @@ class DummyResponse:
 
 
 class CloudflareAdminCreateTests(unittest.TestCase):
+    original_config = app.DEFAULT_CONFIG.copy()
+    original_cf_domain_index = 0
+
     def setUp(self):
         self.original_config = app.config.copy()
         self.original_cf_domain_index = app._cf_domain_index
@@ -149,6 +153,21 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         })
         self.assertEqual(captured["headers"]["Content-Type"], "application/json")
         self.assertEqual(captured["headers"]["x-admin-auth"], "admin-secret")
+
+    def test_gui_loads_cloudflare_default_domain_from_config(self):
+        app.config["defaultDomains"] = "mail.example.com"
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
+        root.withdraw()
+        try:
+            with patch.object(app, "load_config", return_value=app.config):
+                gui = app.GrokRegisterGUI(root)
+
+            self.assertEqual(gui.default_domains_var.get(), "mail.example.com")
+        finally:
+            root.destroy()
 
 
 if __name__ == "__main__":
