@@ -169,6 +169,78 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_yyds_uses_configured_default_domain(self):
+        app.config.update({
+            "yyds_api_key": "api-key",
+            "yyds_jwt": "",
+            "yyds_default_domain": "mail.example.com",
+        })
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return DummyResponse({
+                "success": True,
+                "data": {"address": "abc123@mail.example.com", "token": "temp-token"},
+            })
+
+        with patch.object(app, "yyds_generate_username", return_value="abc123"), \
+                patch.object(app, "http_post", side_effect=fake_post), \
+                patch.object(app, "yyds_pick_domain") as pick_domain:
+            address, token = app.yyds_get_email_and_token()
+
+        self.assertEqual(address, "abc123@mail.example.com")
+        self.assertEqual(token, "temp-token")
+        self.assertEqual(captured["url"], "https://maliapi.215.im/v1/accounts")
+        self.assertEqual(captured["json"], {
+            "localPart": "abc123",
+            "domain": "mail.example.com",
+        })
+        pick_domain.assert_not_called()
+
+    def test_yyds_empty_default_domain_keeps_auto_pick(self):
+        app.config.update({
+            "yyds_api_key": "api-key",
+            "yyds_jwt": "",
+            "yyds_default_domain": "",
+        })
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured.update(kwargs)
+            return DummyResponse({
+                "success": True,
+                "data": {"address": "abc123@auto.example.com", "token": "temp-token"},
+            })
+
+        with patch.object(app, "yyds_generate_username", return_value="abc123"), \
+                patch.object(app, "yyds_pick_domain", return_value="auto.example.com"), \
+                patch.object(app, "http_post", side_effect=fake_post):
+            address, token = app.yyds_get_email_and_token()
+
+        self.assertEqual(address, "abc123@auto.example.com")
+        self.assertEqual(token, "temp-token")
+        self.assertEqual(captured["json"], {
+            "localPart": "abc123",
+            "domain": "auto.example.com",
+        })
+
+    def test_gui_loads_yyds_default_domain_from_config(self):
+        app.config["yyds_default_domain"] = "mail.example.com"
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(f"Tk display unavailable: {exc}")
+        root.withdraw()
+        try:
+            with patch.object(app, "load_config", return_value=app.config):
+                gui = app.GrokRegisterGUI(root)
+
+            self.assertEqual(gui.yyds_default_domain_var.get(), "mail.example.com")
+        finally:
+            root.destroy()
+
 
 if __name__ == "__main__":
     unittest.main()

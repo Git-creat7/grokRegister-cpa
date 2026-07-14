@@ -19,5 +19,6 @@
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
-  "yyds_jwt": ""
+  "yyds_jwt": "",
+  "yyds_default_domain": ""
 }

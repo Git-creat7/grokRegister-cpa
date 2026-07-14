@@ -79,6 +79,7 @@ cp config.example.json config.json
 | `cloudflare_custom_auth` | Worker 全局密码（`PASSWORDS`），注入 `x-custom-auth` |
 | `cloudflare_path_*` | domains / accounts / token / messages 路径 |
 | `defaultDomains` | Cloudflare 默认收信域名 |
+| `yyds_default_domain` | YYDS 固定收信域名；留空则自动选择已验证域名 |
 
 ### Cloudflare 邮箱（默认匿名）
 
@@ -122,6 +123,19 @@ Worker 若配置了全局 `PASSWORDS`，再加：
 ```json
 { "cloudflare_custom_auth": "你的全局访问密码" }
 ```
+
+### YYDS 邮箱固定域名
+
+默认 YYDS 会自动选择已验证域名。若要固定使用指定收信域名，配置：
+
+```json
+{
+  "email_provider": "yyds",
+  "yyds_default_domain": "你的收信域名.com"
+}
+```
+
+GUI 中也可以在「YYDS 收信域名」输入框填写；留空则保持自动选择。
 
 ## CPA 自动入库
 

@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     # 远程 CPA：通过 Management API POST /v0/management/auth-files 上传
     "cpa_remote_url": "",
     "cpa_management_key": "",
+    # YYDS 邮箱：留空则自动选择已验证域名；填写后固定使用该域名创建邮箱
+    "yyds_default_domain": "",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -568,6 +570,10 @@ def get_yyds_jwt():
     return config.get("yyds_jwt", "")
 
 
+def get_yyds_default_domain():
+    return str(config.get("yyds_default_domain", "") or "").strip()
+
+
 def yyds_get_domains(api_key=None, jwt=None):
     key = api_key or get_yyds_api_key()
     token = jwt or get_yyds_jwt()
@@ -582,7 +588,7 @@ def yyds_get_domains(api_key=None, jwt=None):
     return data.get("data", []) if data.get("success") else []
 
 
-def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
+def yyds_create_account(local_part=None, domain=None, api_key=None, jwt=None):
     key = api_key or get_yyds_api_key()
     token = jwt or get_yyds_jwt()
     headers = {"Content-Type": "application/json"}
@@ -591,8 +597,8 @@ def yyds_create_account(address=None, domain=None, api_key=None, jwt=None):
     elif key:
         headers["X-API-Key"] = key
     payload = {}
-    if address:
-        payload["address"] = address
+    if local_part:
+        payload["localPart"] = local_part
     if domain:
         payload["domain"] = domain
     elif key or token:
@@ -685,10 +691,10 @@ def yyds_get_email_and_token(api_key=None, jwt=None):
     token = jwt or get_yyds_jwt()
     if not token and not key:
         raise Exception("YYDS API Key 或 JWT 未配置")
-    domain = yyds_pick_domain(api_key=key, jwt=token)
+    domain = get_yyds_default_domain() or yyds_pick_domain(api_key=key, jwt=token)
     username = yyds_generate_username(10)
     result = yyds_create_account(
-        address=username, domain=domain, api_key=key, jwt=token
+        local_part=username, domain=domain, api_key=key, jwt=token
     )
     address = result.get("address") or f"{username}@{domain}"
     temp_token = result.get("token")
@@ -2681,15 +2687,20 @@ class GrokRegisterGUI:
         self.default_domains_entry = tk_entry(config_frame, textvariable=self.default_domains_var, width=34)
         add_field(self.default_domains_entry, 5, 1)
 
-        add_label(5, 2, "Cloudflare 全局密码:")
+        add_label(5, 2, "YYDS 收信域名:")
+        self.yyds_default_domain_var = tk.StringVar(value=str(config.get("yyds_default_domain", "")))
+        self.yyds_default_domain_entry = tk_entry(config_frame, textvariable=self.yyds_default_domain_var, width=34)
+        add_field(self.yyds_default_domain_entry, 5, 3)
+
+        add_label(6, 0, "Cloudflare 全局密码:")
         self.cloudflare_custom_auth_var = tk.StringVar(value=str(config.get("cloudflare_custom_auth", "")))
         self.cloudflare_custom_auth_entry = tk_entry(config_frame, textvariable=self.cloudflare_custom_auth_var, width=34)
-        add_field(self.cloudflare_custom_auth_entry, 5, 3)
+        add_field(self.cloudflare_custom_auth_entry, 6, 1)
 
-        add_label(6, 0, "CPA 直出(SSO→auth):")
+        add_label(6, 2, "CPA 直出(SSO→auth):")
         self.cpa_auto_add_var = tk.BooleanVar(value=bool(config.get("cpa_auto_add", False)))
         self.cpa_auto_add_check = tk_checkbutton(config_frame, variable=self.cpa_auto_add_var)
-        add_field(self.cpa_auto_add_check, 6, 1, sticky=tk.W)
+        add_field(self.cpa_auto_add_check, 6, 3, sticky=tk.W)
 
         add_label(7, 0, "CPA auth 目录:")
         self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "")))
@@ -2790,6 +2801,7 @@ class GrokRegisterGUI:
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
         config["defaultDomains"] = self.default_domains_var.get().strip()
+        config["yyds_default_domain"] = self.yyds_default_domain_var.get().strip()
         config["cloudflare_custom_auth"] = self.cloudflare_custom_auth_var.get().strip()
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
