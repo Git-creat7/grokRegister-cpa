@@ -1,5 +1,8 @@
 {
   "duckmail_api_key": "",
+  "cloudmail_url": "",
+  "cloudmail_admin_email": "",
+  "cloudmail_password": "",
   "cloudflare_api_base": "https://temp-mail.example.com",
   "cloudflare_api_key": "",
   "cloudflare_auth_mode": "none",

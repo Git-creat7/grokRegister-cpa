@@ -33,7 +33,7 @@
 - 注册成功后自动入库 CPA（本地目录 / 远程 Management API，可同时开）
 - GUI + CLI 两种运行方式（CLI 仍会打开浏览器完成注册页）
 - Chromium/Chrome 自动处理 Turnstile
-- DuckMail / YYDS / Cloudflare 临时邮箱
+- DuckMail / YYDS / Cloudflare / CloudMail 临时邮箱
 - 注册后可选开启 NSFW
 - 页面卡住重试、验证码失败换邮箱、浏览器重启与内存清理
 - CLI：一次 `Ctrl+C` 安全停止，清理阶段不刷 traceback；再按一次强制中断
@@ -69,16 +69,37 @@ cp config.example.json config.json
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` |
+| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `cloudmail` |
 | `register_count` | 目标注册数量 |
 | `proxy` | 代理；换 token 的 OAuth 请求也走此代理 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
+| `cloudmail_url` | CloudMail（maillab/cloud-mail）站点根地址，不要附加 `/api` |
+| `cloudmail_admin_email` | CloudMail 管理员邮箱；也可用环境变量 `CLOUDMAIL_ADMIN_EMAIL` |
+| `cloudmail_password` | CloudMail 管理员密码；也可用环境变量 `CLOUDMAIL_PASSWORD` |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
 | `cloudflare_api_key` | 默认匿名模式留空；admin 模式填 `ADMIN_PASSWORD` |
 | `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key` |
 | `cloudflare_custom_auth` | Worker 全局密码（`PASSWORDS`），注入 `x-custom-auth` |
 | `cloudflare_path_*` | domains / accounts / token / messages 路径 |
-| `defaultDomains` | Cloudflare 默认收信域名 |
+| `defaultDomains` | Cloudflare / CloudMail 默认收信域名，多个域名用逗号分隔 |
+
+### CloudMail 邮箱
+
+支持自建 [maillab/cloud-mail](https://github.com/maillab/cloud-mail)。程序会通过管理员接口创建随机收件地址，使用公开邮件接口按完整地址轮询验证码，并在收件结束后自动删除该地址。
+
+```json
+{
+  "email_provider": "cloudmail",
+  "cloudmail_url": "https://mail.example.com",
+  "cloudmail_admin_email": "admin@example.com",
+  "cloudmail_password": "你的管理员密码",
+  "defaultDomains": "example.com"
+}
+```
+
+`cloudmail_url` 填站点根地址，不要附加 `/api`。管理员邮箱、密码也可分别通过 `CLOUDMAIL_ADMIN_EMAIL`、`CLOUDMAIL_PASSWORD` 提供；站点地址可通过 `CLOUDMAIL_URL` 提供，环境变量优先于 `config.json`。
+
+CloudMail 需要以下接口可用：`/api/login`、`/api/account/add`、`/api/account/delete`、`/api/public/genToken` 和 `/api/public/emailList`。配置的 `defaultDomains` 必须已经接入该 CloudMail 实例的收信路由。
 
 ### Cloudflare 邮箱（默认匿名）
 
