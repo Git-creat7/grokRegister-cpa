@@ -87,6 +87,34 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
                         True,
                         f"Cloudflare 直建模式可用（domains HTTP {resp.status_code}，当前流程不依赖该接口）",
                     )
+                # cloudflare_temp_email 常见：无 /api/domains 或鉴权后仍 401。
+                # 实际建号走 /api/new_address 或 /admin/new_address；改探 open_api/settings。
+                try:
+                    settings_headers = cloudflare_provider.apply_custom_auth(
+                        {}, custom_auth
+                    )
+                    settings_resp = http_get(
+                        f"{base}/open_api/settings",
+                        headers=settings_headers,
+                        timeout=10,
+                    )
+                    if settings_resp.status_code < 400:
+                        return (
+                            "邮箱API",
+                            True,
+                            f"Cloudflare 可达（open_api/settings HTTP {settings_resp.status_code}；domains HTTP {resp.status_code} 可忽略）",
+                        )
+                except Exception:
+                    pass
+                # admin 建号路径：domains 非必须
+                if cloudflare_provider.is_admin_create_path(accounts_path) and (
+                    api_key or custom_auth
+                ):
+                    return (
+                        "邮箱API",
+                        True,
+                        f"Cloudflare admin 建号模式可用（domains HTTP {resp.status_code}，当前流程不依赖该接口）",
+                    )
                 return "邮箱API", False, f"Cloudflare HTTP {resp.status_code}"
             return "邮箱API", True, f"Cloudflare 可达 HTTP {resp.status_code}"
 
@@ -155,23 +183,42 @@ def check_cpa(config: dict, http_get: Callable) -> CheckResult:
             return "CPA", False, "已配远程地址但缺少管理密钥"
         try:
             u = urlparse(remote)
-            host = u.hostname or "127.0.0.1"
+            host = (u.hostname or "127.0.0.1").lower()
             port = u.port or (443 if u.scheme == "https" else 80)
-            if not _tcp_open(host, port):
-                return "CPA", False, f"远程不可达 {host}:{port}"
             base = remote.rstrip("/")
-            # 管理 API 列表
-            resp = http_get(
-                f"{base}/v0/management/auth-files",
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=8,
-                proxies={},  # CPA 一般本机
+            # 远程 CPA 可能需走 config.proxy（国内直连 443 常超时，但经代理 HTTP 正常）。
+            # 本机 / 局域网地址强制直连，避免把 localhost 塞进系统代理导致假失败。
+            proxy = str(config.get("proxy", "") or "").strip()
+            is_local_host = host in {
+                "127.0.0.1",
+                "localhost",
+                "::1",
+                "0.0.0.0",
+            } or host.startswith("192.168.") or host.startswith("10.") or (
+                host.startswith("172.")
+                and len(host.split(".")) >= 2
+                and host.split(".")[1].isdigit()
+                and 16 <= int(host.split(".")[1]) <= 31
             )
+            req_kwargs = {
+                "headers": {"Authorization": f"Bearer {key}"},
+                "timeout": 12,
+            }
+            use_proxy = bool(proxy) and not is_local_host
+            if use_proxy:
+                req_kwargs["proxies"] = {"http": proxy, "https": proxy}
+            else:
+                # 未配代理或本机 CPA：先 TCP 预检，再强制直连
+                if not _tcp_open(host if host != "localhost" else "127.0.0.1", port):
+                    return "CPA", False, f"远程不可达 {host}:{port}"
+                req_kwargs["proxies"] = {}
+            resp = http_get(f"{base}/v0/management/auth-files", **req_kwargs)
             if resp.status_code in (401, 403):
                 return "CPA", False, f"管理密钥无效 HTTP {resp.status_code}"
             if resp.status_code >= 500:
                 return "CPA", False, f"CPA 服务异常 HTTP {resp.status_code}"
-            parts.append(f"远程OK HTTP {resp.status_code}")
+            via = "via proxy" if use_proxy else "direct"
+            parts.append(f"远程OK HTTP {resp.status_code} ({via})")
         except Exception as exc:
             return "CPA", False, f"远程探测失败: {exc}"
     return "CPA", True, "；".join(parts) if parts else "OK"

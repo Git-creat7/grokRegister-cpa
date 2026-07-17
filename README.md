@@ -85,6 +85,8 @@ cp config.example.json config.json
 **连通性检查**
 - GUI「连通性检查」或开始注册前自动跑
 - 检查项：代理 TCP/出站、邮箱 API、CPA 本地目录/远程 Management API
+- Cloudflare：`/api/domains` 401 时会回退探测 `/open_api/settings`；admin 建号模式不依赖 domains
+- 远程 CPA：若配置了 `proxy` 则经代理探测（公网）；`127.0.0.1` / 局域网地址强制直连
 - 失败默认只警告，不强制拦截开跑
 
 **NSFW**

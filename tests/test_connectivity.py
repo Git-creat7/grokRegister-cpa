@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import MagicMock
+import unittest.mock
 
 import connectivity
 
@@ -48,6 +49,10 @@ class ConnectivityTests(unittest.TestCase):
         self.assertIn("200", detail)
 
     def test_email_cloudflare_unauthorized_is_failure(self):
+        def fake_get(url, **kwargs):
+            # open_api/settings 也失败时才判 FAIL
+            return DummyResp(401)
+
         name, ok, detail = connectivity.check_email_api(
             "cloudflare",
             {
@@ -55,11 +60,76 @@ class ConnectivityTests(unittest.TestCase):
                 "cloudflare_api_key": "bad-secret",
                 "cloudflare_auth_mode": "x-api-key",
             },
-            lambda *a, **k: DummyResp(401),
+            fake_get,
             lambda *a, **k: DummyResp(),
         )
         self.assertFalse(ok)
         self.assertIn("401", detail)
+
+    def test_email_cloudflare_domains_401_but_open_api_ok(self):
+        def fake_get(url, **kwargs):
+            if url.endswith("/open_api/settings"):
+                return DummyResp(200)
+            return DummyResp(401)
+
+        name, ok, detail = connectivity.check_email_api(
+            "cloudflare",
+            {
+                "cloudflare_api_base": "https://mail.example.com",
+                "cloudflare_custom_auth": "global-pass",
+                "cloudflare_auth_mode": "x-admin-auth",
+                "cloudflare_api_key": "admin",
+                "cloudflare_path_accounts": "/admin/new_address",
+            },
+            fake_get,
+            lambda *a, **k: DummyResp(),
+        )
+        self.assertTrue(ok)
+        self.assertIn("open_api/settings", detail)
+
+    def test_cpa_remote_uses_proxy_when_configured(self):
+        captured = {}
+
+        def fake_get(url, **kwargs):
+            captured.update(kwargs)
+            return DummyResp(200, '{"files":[]}')
+
+        name, ok, detail = connectivity.check_cpa(
+            {
+                "cpa_auto_add": True,
+                "cpa_remote_url": "https://2api.example.com",
+                "cpa_management_key": "secret",
+                "proxy": "http://127.0.0.1:10808",
+            },
+            fake_get,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(
+            captured.get("proxies"),
+            {"http": "http://127.0.0.1:10808", "https": "http://127.0.0.1:10808"},
+        )
+        self.assertIn("via proxy", detail)
+
+    def test_cpa_local_remote_ignores_proxy(self):
+        captured = {}
+
+        def fake_get(url, **kwargs):
+            captured.update(kwargs)
+            return DummyResp(200, '{"files":[]}')
+
+        with unittest.mock.patch.object(connectivity, "_tcp_open", return_value=True):
+            name, ok, detail = connectivity.check_cpa(
+                {
+                    "cpa_auto_add": True,
+                    "cpa_remote_url": "http://127.0.0.1:8317",
+                    "cpa_management_key": "secret",
+                    "proxy": "http://127.0.0.1:10808",
+                },
+                fake_get,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(captured.get("proxies"), {})
+        self.assertIn("direct", detail)
 
     def test_email_cloudflare_anonymous_direct_create_does_not_need_domains(self):
         name, ok, detail = connectivity.check_email_api(
