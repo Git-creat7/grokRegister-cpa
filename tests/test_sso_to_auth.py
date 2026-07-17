@@ -1,10 +1,140 @@
+import io
+import json
 import unittest
-from unittest.mock import patch
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import sso_to_auth_json as s2a
 
 
 class ExtractNextActionTests(unittest.TestCase):
+    def test_parse_sso_line_keeps_email_prefix(self):
+        self.assertEqual(
+            s2a.parse_sso_line("user@example.com----password----sso-value"),
+            ("user@example.com", "sso-value"),
+        )
+        self.assertEqual(
+            s2a.parse_sso_line("user@example.com----sso-value"),
+            ("user@example.com", "sso-value"),
+        )
+        self.assertEqual(s2a.parse_sso_line("sso-value"), ("", "sso-value"))
+
+    def test_collect_existing_auth_emails_ignores_invalid_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "valid.json").write_text(
+                '{"type":"xai","email":"user@example.com","access_token":"token"}',
+                encoding="utf-8",
+            )
+            (root / "invalid.json").write_text("not json", encoding="utf-8")
+            (root / "partial.json").write_text(
+                '{"email":"retry@example.com"}', encoding="utf-8"
+            )
+            (root / "xai-legacy@example.com.json").write_text(
+                '{"type":"xai","access_token":"token"}', encoding="utf-8"
+            )
+
+            self.assertEqual(
+                s2a.collect_existing_auth_emails(out_dir=directory),
+                {"user@example.com", "legacy@example.com"},
+            )
+
+    def test_batch_main_skips_existing_email_before_token_exchange(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sso.txt"
+            source.write_text(
+                "user@example.com----password----sso-value\n", encoding="utf-8"
+            )
+            cpa_dir = root / "auths"
+            cpa_dir.mkdir()
+            (cpa_dir / "xai-user@example.com.json").write_text(
+                '{"type":"xai","email":"user@example.com","access_token":"token"}',
+                encoding="utf-8",
+            )
+
+            argv = [
+                "sso_to_auth_json.py",
+                "--sso",
+                str(source),
+                "--cpa-auth-dir",
+                str(cpa_dir),
+            ]
+            with patch.object(sys, "argv", argv), patch.object(
+                s2a,
+                "sso_to_token",
+                side_effect=AssertionError("existing account must be skipped"),
+            ), patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(s2a.main(), 0)
+
+    def test_auto_scan_uses_safe_files_and_keeps_latest_email(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "accounts_20260701_000000.txt").write_text(
+                "user@example.com----old-password----old-sso\n", encoding="utf-8"
+            )
+            (root / "accounts_20260702_000000.txt").write_text(
+                "user@example.com----new-password----new-sso\n", encoding="utf-8"
+            )
+            (root / "sso_pending.txt").write_text(
+                "pending@example.com----pending-sso\n", encoding="utf-8"
+            )
+            (root / "requirements.txt").write_text("not-an-sso\n", encoding="utf-8")
+
+            entries, files = s2a.scan_sso_entries(root)
+
+            self.assertEqual(len(files), 3)
+            self.assertEqual(
+                dict(entries),
+                {
+                    "user@example.com": "new-sso",
+                    "pending@example.com": "pending-sso",
+                },
+            )
+
+    def test_auto_scan_main_loads_config_and_skips_existing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "accounts_20260701_000000.txt").write_text(
+                "user@example.com----password----sso-value\n", encoding="utf-8"
+            )
+            cpa_dir = root / "auths"
+            cpa_dir.mkdir()
+            (cpa_dir / "xai-user@example.com.json").write_text(
+                '{"type":"xai","email":"user@example.com","access_token":"token"}',
+                encoding="utf-8",
+            )
+            (root / "config.json").write_text(
+                json.dumps({"cpa_auth_dir": str(cpa_dir)}), encoding="utf-8"
+            )
+
+            argv = ["sso_to_auth_json.py", "--scan-dir", str(root)]
+            with patch.object(sys, "argv", argv), patch.object(
+                s2a,
+                "sso_to_token",
+                side_effect=AssertionError("existing account must be skipped"),
+            ), patch.object(sys, "stdout", io.StringIO()):
+                self.assertEqual(s2a.main(), 0)
+
+    def test_collect_remote_auth_emails_supports_email_and_filename(self):
+        response = MagicMock()
+        response.json.return_value = {
+            "files": [
+                {"type": "xai", "email": "User@Example.com", "name": "record.json"},
+                {"provider": "xai", "email": "", "name": "xai-legacy@example.com.json"},
+                {"type": "openai", "email": "ignore@example.com", "name": "other.json"},
+            ]
+        }
+        with patch("requests.get", return_value=response) as get:
+            self.assertEqual(
+                s2a.collect_remote_auth_emails("http://127.0.0.1:8317", "key"),
+                {"user@example.com", "legacy@example.com"},
+            )
+        get.assert_called_once()
+        response.raise_for_status.assert_called_once()
+
     def test_extract_create_server_reference(self):
         html = 'createServerReference("401b73e22a5e68737d0037e1aa449fef82cd1b35fb", callServer)'
         ids = s2a._extract_next_action_ids(html)

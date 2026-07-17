@@ -238,6 +238,29 @@ SSO 不是 CPA 凭据。程序会：
 
 已有 SSO 时可脱离注册流程：
 
+#### GUI 补转
+
+注册任务停止时，点击主界面的 **补转缺失 SSO**。程序会在仓库目录扫描全部 `accounts_*.txt` 和 `sso_pending.txt`，按邮箱去重，然后使用 GUI 当前的代理与 CPA 配置，只转换尚无有效本地 auth JSON 的账号。转换在后台线程运行，不会卡住界面；点击“停止”会在当前账号完成后停止补转。
+
+#### Python 自动扫描
+
+在仓库目录直接运行，无需指定 TXT：
+
+```bash
+python sso_to_auth_json.py
+```
+
+程序会自动读取当前目录的 `config.json`，扫描 `accounts_*.txt` 与 `sso_pending.txt`。也可指定其他目录和配置：
+
+```bash
+python sso_to_auth_json.py --scan-dir /path/to/register-output \
+  --config /path/to/register-output/config.json
+```
+
+只扫描上述账号文件，不会读取 `requirements.txt`、`mail_credentials.txt` 或其他无关 TXT。
+
+#### 显式指定文件
+
 ```bash
 # 写本地目录
 python sso_to_auth_json.py --sso sso_list.txt --cpa-auth-dir /path/to/auths
@@ -253,7 +276,9 @@ python sso_to_auth_json.py --sso-cookie 'eyJ...' \
   --proxy http://127.0.0.1:7890
 ```
 
-`sso_list.txt`：一行一个 SSO，或 `邮箱----密码----sso`。
+`sso_list.txt`：一行一个 SSO、`邮箱----sso`，或 `邮箱----密码----sso`。
+
+批量转换会先按邮箱扫描本地有效 auth JSON；配置了远程 CPA 时，也会通过 Management API 检索远程已有账号。已存在的账号会跳过，缺失、损坏或上次转换失败（没有有效 JSON）的账号才会继续转换。要重试账号，保留 TXT 行并删除对应损坏的 JSON 即可。
 
 ### 为什么必须用授权码流程
 

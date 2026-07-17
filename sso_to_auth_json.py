@@ -89,6 +89,7 @@ CPA_GROK_HEADERS = {
 }
 CPA_PROBE_MODEL = "grok-4.5"
 CPA_PROBE_URL = f"{CPA_GROK_BASE_URL}/responses"
+AUTO_SSO_PATTERNS = ("accounts_*.txt", "sso_pending.txt")
 
 
 def b64url_decode(seg: str) -> bytes:
@@ -687,28 +688,306 @@ def merge_auth_json(path: Path, auth_key: str, entry: dict, unique: bool = True)
     os.replace(tmp, path)
 
 
-def load_sso_list(path: str | None, single: str | None) -> list[str]:
+def parse_sso_line(raw_line: str) -> tuple[str, str]:
+    """解析一行 SSO，返回 (email, sso)。"""
+    line = str(raw_line or "").strip()
+    if "----" not in line:
+        return "", line
+    parts = line.split("----")
+    first = parts[0].strip()
+    email = first if "@" in first and len(parts) >= 2 else ""
+    return email, parts[-1].strip()
+
+
+def load_sso_entries(path: str | None, single: str | None) -> list[tuple[str, str]]:
     if single:
-        return [single.strip()]
+        return [("", single.strip())]
     if not path:
         return []
     out = []
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        # 兼容 邮箱----密码----sso
-        if "----" in line:
-            parts = line.split("----")
-            line = parts[-1].strip()
-        out.append(line)
+        email, sso = parse_sso_line(line)
+        if sso:
+            out.append((email, sso))
     return out
 
 
+def load_sso_list(path: str | None, single: str | None) -> list[str]:
+    """兼容旧调用方，仅返回 SSO 值。"""
+    return [sso for _email, sso in load_sso_entries(path, single)]
+
+
+def _auth_email_from_object(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    email = str(value.get("email") or "").strip().casefold()
+    if not email or not (value.get("access_token") or value.get("key")):
+        return ""
+    return email
+
+
+def _contains_auth_credential(value: object) -> bool:
+    if isinstance(value, dict):
+        if value.get("access_token") or value.get("key"):
+            return True
+        return any(_contains_auth_credential(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_contains_auth_credential(child) for child in value)
+    return False
+
+
+def _auth_emails_from_json(path: Path) -> set[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+    found: set[str] = set()
+
+    def walk(value: object):
+        if isinstance(value, dict):
+            email = _auth_email_from_object(value)
+            if email:
+                found.add(email)
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    # 兼容旧版 CPA 文件：文件名带邮箱，但记录正文没有 email 字段。
+    if not found and _contains_auth_credential(data):
+        stem = path.stem
+        if stem.lower().startswith("xai-"):
+            filename_email = stem[4:].strip().casefold()
+            if "@" in filename_email:
+                found.add(filename_email)
+    return found
+
+
+def collect_existing_auth_emails(
+    out: str | None = None,
+    out_dir: str | None = None,
+    cpa_auth_dir: str | None = None,
+) -> set[str]:
+    """扫描本地输出中的有效 auth，返回已存在邮箱（损坏文件不会被视为已存在）。"""
+    paths: list[Path] = []
+    if out:
+        paths.append(Path(out))
+    for directory in (out_dir, cpa_auth_dir):
+        if directory:
+            paths.extend(Path(directory).glob("*.json"))
+
+    emails: set[str] = set()
+    for path in paths:
+        if path.is_file():
+            emails.update(_auth_emails_from_json(path))
+    return emails
+
+
+def collect_remote_auth_emails(
+    base_url: str,
+    management_key: str,
+    timeout: int = 15,
+) -> set[str]:
+    """通过 CPA Management API 获取远程已存在的 auth 邮箱。"""
+    import requests
+
+    base = str(base_url or "").strip().rstrip("/")
+    key = str(management_key or "").strip()
+    if not base or not key:
+        return set()
+    try:
+        response = requests.get(
+            f"{base}/v0/management/auth-files",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"远程 CPA 已有账号检索失败: {exc}") from exc
+
+    items = payload.get("files", []) if isinstance(payload, dict) else payload
+    emails: set[str] = set()
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("type") or item.get("provider") or "").strip().lower()
+        if provider and provider != "xai":
+            continue
+        email = str(item.get("email") or "").strip().casefold()
+        if not email:
+            name = Path(str(item.get("name") or "")).stem
+            if name.lower().startswith("xai-"):
+                email = name[4:].strip().casefold()
+        if "@" in email:
+            emails.add(email)
+    return emails
+
+
+def discover_sso_files(scan_dir: str | Path = ".") -> list[Path]:
+    root = Path(scan_dir)
+    found: dict[Path, None] = {}
+    for pattern in AUTO_SSO_PATTERNS:
+        for path in sorted(root.glob(pattern)):
+            if path.is_file():
+                found[path] = None
+    return list(found)
+
+
+def scan_sso_entries(scan_dir: str | Path = ".") -> tuple[list[tuple[str, str]], list[Path]]:
+    """扫描安全 TXT 并去重；同邮箱保留后扫描到的最新 SSO。"""
+    files = discover_sso_files(scan_dir)
+    unique: dict[str, tuple[str, str]] = {}
+    for path in files:
+        for email, sso in load_sso_entries(str(path), None):
+            key = f"email:{email.casefold()}" if email else f"sso:{sso}"
+            unique[key] = (email, sso)
+    return list(unique.values()), files
+
+
+def load_conversion_config(path: str | Path) -> dict:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def convert_sso_entries(
+    entries: list[tuple[str, str]],
+    *,
+    out: str | None = None,
+    out_dir: str | None = None,
+    merge: bool = False,
+    cpa_auth_dir: str | None = None,
+    cpa_remote_url: str | None = None,
+    cpa_management_key: str | None = None,
+    proxy: str = "",
+    delay: int = 0,
+    fallback_email: str = "",
+    log=print,
+    should_stop=None,
+) -> dict:
+    local_target_configured = bool(out or out_dir or cpa_auth_dir)
+    local_emails = collect_existing_auth_emails(
+        out=out,
+        out_dir=out_dir,
+        cpa_auth_dir=cpa_auth_dir,
+    )
+    if cpa_remote_url:
+        remote_emails = collect_remote_auth_emails(
+            cpa_remote_url,
+            str(cpa_management_key or ""),
+        )
+        existing_emails = (
+            local_emails.intersection(remote_emails)
+            if local_target_configured
+            else remote_emails
+        )
+    else:
+        existing_emails = local_emails
+    log(f"🚀 SSO → auth.json: {len(entries)} 个, delay={delay}s")
+    if existing_emails:
+        log(f"[*] 已检索到本地有效账号: {len(existing_emails)} 个，重复账号将跳过")
+
+    ok = 0
+    fail = 0
+    skipped = 0
+    stopped = False
+    total = len(entries)
+    for i, (source_email, sso) in enumerate(entries, 1):
+        if should_stop and should_stop():
+            stopped = True
+            log("[!] 用户停止补转，剩余 SSO 未处理")
+            break
+        log(f"[{i}/{total}] 开始检查")
+        email = (source_email or fallback_email or "").strip()
+        email_key = email.casefold()
+        if email_key and email_key in existing_emails:
+            skipped += 1
+            log(f"⏭️ [{i}] 跳过已存在账号: {email}")
+            continue
+        try:
+            token = sso_to_token(sso, proxy=proxy, log=log)
+            if not token:
+                fail += 1
+                log(f"❌ [{i}] 失败")
+                continue
+            key, entry = token_to_auth_entry(token, email=email)
+            uid = entry.get("user_id") or secrets.token_hex(4)
+
+            if out_dir:
+                path = Path(out_dir) / f"{uid}.json"
+                write_auth_json(path, key, entry)
+                log(f"💾 {path}")
+            if out:
+                if merge or total > 1:
+                    merge_auth_json(Path(out), key, entry, unique=True)
+                    log(f"💾 merge → {out}")
+                else:
+                    write_auth_json(Path(out), key, entry)
+                    log(f"💾 {out}")
+
+            if cpa_auth_dir or cpa_remote_url:
+                record = token_to_cpa_record(token, email=email, sso=sso)
+                if cpa_auth_dir:
+                    path = write_cpa_auth(Path(cpa_auth_dir), record)
+                    log(f"💾 CPA 本地 → {path}")
+                if cpa_remote_url:
+                    name = upload_cpa_auth_remote(
+                        cpa_remote_url,
+                        str(cpa_management_key or ""),
+                        record,
+                    )
+                    log(f"💾 CPA 远程 → {cpa_remote_url.rstrip('/')}/.../{name}")
+
+            ok += 1
+            if email_key:
+                existing_emails.add(email_key)
+            log(f"✅ [{i}] 完成 user_id={uid[:12]}...")
+        except Exception as exc:
+            fail += 1
+            log(f"❌ [{i}] 异常: {exc}")
+
+        if delay > 0 and i < total:
+            time.sleep(delay)
+
+    result = {
+        "total": total,
+        "ok": ok,
+        "skipped": skipped,
+        "fail": fail,
+        "stopped": stopped,
+    }
+    status = "已停止" if stopped else "完成"
+    log(f"📊 {status}: {ok}/{total} 成功, {skipped} 跳过, {fail} 失败")
+    return result
+
+
 def main() -> int:
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, OSError):
+        pass
     ap = argparse.ArgumentParser(description="SSO cookie → grok auth.json (纯 HTTP)")
     ap.add_argument("--sso", metavar="FILE", help="sso 列表文件（一行一个 JWT，或 邮箱----密码----sso）")
     ap.add_argument("--sso-cookie", metavar="JWT", help="单个 sso cookie")
+    ap.add_argument(
+        "--scan-dir",
+        default=None,
+        help="自动扫描目录中的 accounts_*.txt 和 sso_pending.txt；未提供 SSO 时默认当前目录",
+    )
+    ap.add_argument(
+        "--config",
+        default=None,
+        help="自动扫描模式使用的 config.json；默认取扫描目录/config.json",
+    )
     ap.add_argument("--out", default=None, help="输出 auth.json 路径（单账号或 --merge）")
     ap.add_argument(
         "--out-dir",
@@ -740,16 +1019,42 @@ def main() -> int:
     ap.add_argument("--proxy", default="", help="授权码流程走代理，如 http://127.0.0.1:7890")
     args = ap.parse_args()
 
-    cookies = load_sso_list(args.sso, args.sso_cookie)
-    if not cookies:
-        ap.error("需要 --sso 或 --sso-cookie")
+    auto_scan = not args.sso and not args.sso_cookie
+    scan_files: list[Path] = []
+    if auto_scan:
+        scan_dir = Path(args.scan_dir or ".")
+        entries, scan_files = scan_sso_entries(scan_dir)
+        config_path = Path(args.config) if args.config else scan_dir / "config.json"
+        saved_config = load_conversion_config(config_path)
+        if args.cpa_auth_dir is None:
+            args.cpa_auth_dir = str(saved_config.get("cpa_auth_dir") or "") or None
+        if args.cpa_remote_url is None:
+            args.cpa_remote_url = str(saved_config.get("cpa_remote_url") or "") or None
+        if args.cpa_management_key is None:
+            args.cpa_management_key = str(saved_config.get("cpa_management_key") or "") or None
+        if not args.proxy:
+            args.proxy = str(saved_config.get("proxy") or "")
+        print(
+            f"[*] 自动扫描 {scan_dir.resolve()}: {len(scan_files)} 个 TXT，"
+            f"{len(entries)} 个去重 SSO"
+        )
+    else:
+        entries = load_sso_entries(args.sso, args.sso_cookie)
+    if not entries:
+        ap.error("未找到可转换的 SSO；请检查 accounts_*.txt / sso_pending.txt 或显式传入 --sso")
 
     if args.cpa_remote_url and not args.cpa_management_key:
         ap.error("使用 --cpa-remote-url 时必须同时提供 --cpa-management-key")
     if args.cpa_management_key and not args.cpa_remote_url:
         ap.error("使用 --cpa-management-key 时必须同时提供 --cpa-remote-url")
 
-    if len(cookies) > 1 and not args.out_dir and not args.merge:
+    if (
+        len(entries) > 1
+        and not args.out_dir
+        and not args.merge
+        and not args.cpa_auth_dir
+        and not args.cpa_remote_url
+    ):
         # 默认批量写目录
         args.out_dir = args.out_dir or "./auth_out"
         print(f"批量模式默认 --out-dir {args.out_dir}")
@@ -760,61 +1065,23 @@ def main() -> int:
         and args.out_dir is None
         and not args.cpa_auth_dir
         and not args.cpa_remote_url
-        and len(cookies) == 1
+        and len(entries) == 1
     ):
         args.out = str(Path.home() / ".grok" / "auth.json")
 
-    print(f"🚀 SSO → auth.json: {len(cookies)} 个, delay={args.delay}s")
-    ok = 0
-    fail = 0
-
-    for i, sso in enumerate(cookies, 1):
-        print(f"\n{'=' * 60}\n[{i}/{len(cookies)}] ...\n{'=' * 60}")
-        try:
-            token = sso_to_token(sso, proxy=args.proxy)
-            if not token:
-                fail += 1
-                print(f"  ❌ [{i}] 失败")
-                continue
-            key, entry = token_to_auth_entry(token, email=args.email)
-            uid = entry.get("user_id") or secrets.token_hex(4)
-
-            if args.out_dir:
-                p = Path(args.out_dir) / f"{uid}.json"
-                write_auth_json(p, key, entry)
-                print(f"  💾 {p}")
-            if args.out:
-                if args.merge or len(cookies) > 1:
-                    merge_auth_json(Path(args.out), key, entry, unique=True)
-                    print(f"  💾 merge → {args.out}")
-                else:
-                    write_auth_json(Path(args.out), key, entry)
-                    print(f"  💾 {args.out}")
-
-            if args.cpa_auth_dir or args.cpa_remote_url:
-                record = token_to_cpa_record(token, email=args.email, sso=sso)
-                if args.cpa_auth_dir:
-                    cp = write_cpa_auth(Path(args.cpa_auth_dir), record)
-                    print(f"  💾 CPA 本地 → {cp}")
-                if args.cpa_remote_url:
-                    name = upload_cpa_auth_remote(
-                        args.cpa_remote_url,
-                        args.cpa_management_key,
-                        record,
-                    )
-                    print(f"  💾 CPA 远程 → {args.cpa_remote_url.rstrip('/')}/.../{name}")
-
-            ok += 1
-            print(f"  ✅ [{i}] 完成 user_id={uid[:12]}...")
-        except Exception as e:
-            fail += 1
-            print(f"  ❌ [{i}] 异常: {e}")
-
-        if args.delay > 0 and i < len(cookies):
-            time.sleep(args.delay)
-
-    print(f"\n{'=' * 60}\n📊 完成: {ok}/{len(cookies)} 成功, {fail} 失败")
-    return 0 if fail == 0 else 1
+    result = convert_sso_entries(
+        entries,
+        out=args.out,
+        out_dir=args.out_dir,
+        merge=args.merge,
+        cpa_auth_dir=args.cpa_auth_dir,
+        cpa_remote_url=args.cpa_remote_url,
+        cpa_management_key=args.cpa_management_key,
+        proxy=args.proxy,
+        delay=args.delay,
+        fallback_email=args.email,
+    )
+    return 0 if result["fail"] == 0 else 1
 
 
 if __name__ == "__main__":

@@ -1578,6 +1578,8 @@ class GrokRegisterGUI:
         self.root.geometry("1120x900")
         self.root.minsize(960, 700)
         self.is_running = False
+        self.sso_convert_running = False
+        self.sso_convert_stop_requested = False
         self.batch_count = 0
         self.success_count = 0
         self.fail_count = 0
@@ -1946,6 +1948,12 @@ class GrokRegisterGUI:
         self.close_browser_on_stop_check.pack(side=tk.LEFT, padx=(2, 8))
         self.check_btn = tk_button(btn_frame, text="连通性检查", command=self.run_connectivity_check)
         self.check_btn.pack(side=tk.LEFT, padx=5)
+        self.sso_convert_btn = tk_button(
+            btn_frame,
+            text="补转缺失 SSO",
+            command=self.start_sso_recovery,
+        )
+        self.sso_convert_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
 
@@ -2073,6 +2081,9 @@ class GrokRegisterGUI:
 
     def run_connectivity_check(self):
         """一键测：代理 / 邮箱 API / CPA。"""
+        if self.sso_convert_running:
+            self.log("[!] SSO 补转正在运行，请结束后再检查连通性")
+            return
         # 先把当前 GUI 关键字段写回内存配置（不强制保存文件）
         try:
             config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
@@ -2111,11 +2122,93 @@ class GrokRegisterGUI:
         threading.Thread(target=_job, daemon=True).start()
 
     def _on_check_done(self, text, all_ok):
-        self.check_btn.config(state=tk.NORMAL)
+        self.check_btn.config(state=tk.DISABLED if self.sso_convert_running else tk.NORMAL)
         for line in str(text).splitlines():
             self.log(f"[检查] {line}")
         self.status_var.set("检查通过" if all_ok else "检查有失败项")
         self.status_label.config(foreground="green" if all_ok else "orange")
+
+    def start_sso_recovery(self):
+        if self.is_running:
+            self.log("[!] 注册任务正在运行，请结束后再补转 SSO")
+            return
+        if self.sso_convert_running:
+            self.log("[!] SSO 补转已经在运行")
+            return
+
+        config["proxy"] = self.proxy_var.get().strip()
+        config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
+        config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
+        config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        if not config["cpa_auth_dir"] and not config["cpa_remote_url"]:
+            self.log("[!] 请先配置 CPA auth 目录或远程地址")
+            return
+        if config["cpa_remote_url"] and not config["cpa_management_key"]:
+            self.log("[!] 已配置 CPA 远程地址，但缺少管理密钥")
+            return
+        save_config()
+
+        self.sso_convert_running = True
+        self.sso_convert_stop_requested = False
+        self.start_btn.config(state=tk.DISABLED)
+        self.sso_convert_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.check_btn.config(state=tk.DISABLED)
+        self.status_var.set("SSO 补转中...")
+        self.status_label.config(foreground="blue")
+        self.log("[*] 开始扫描 accounts_*.txt 和 sso_pending.txt，补转缺失 SSO...")
+
+        def _job():
+            result = None
+            error = ""
+            try:
+                entries, files = _s2cpa.scan_sso_entries(APP_DIR)
+                self.log(
+                    f"[补转] 扫描到 {len(files)} 个 TXT，"
+                    f"去重后 {len(entries)} 个 SSO"
+                )
+                if not entries:
+                    result = {"total": 0, "ok": 0, "skipped": 0, "fail": 0, "stopped": False}
+                    self.log("[补转] [!] 未找到可转换的 SSO")
+                else:
+                    result = _s2cpa.convert_sso_entries(
+                        entries,
+                        cpa_auth_dir=config["cpa_auth_dir"] or None,
+                        cpa_remote_url=config["cpa_remote_url"] or None,
+                        cpa_management_key=config["cpa_management_key"] or None,
+                        proxy=config["proxy"],
+                        log=lambda message: self.log(f"[补转] {str(message).strip()}"),
+                        should_stop=lambda: self.sso_convert_stop_requested,
+                    )
+            except Exception as exc:
+                error = str(exc)
+            self.ui_queue.put((self._on_sso_recovery_done, (result, error)))
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _on_sso_recovery_done(self, result, error):
+        self.sso_convert_running = False
+        self.sso_convert_stop_requested = False
+        self.start_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.sso_convert_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL if self.is_running else tk.DISABLED)
+        self.check_btn.config(state=tk.NORMAL)
+        if error:
+            self.log(f"[补转] [-] 任务异常: {error}")
+            self.status_var.set("SSO 补转失败")
+            self.status_label.config(foreground="red")
+            return
+
+        result = result or {}
+        if result.get("stopped"):
+            self.status_var.set("SSO 补转已停止")
+            self.status_label.config(foreground="orange")
+        elif result.get("fail"):
+            self.status_var.set("SSO 补转有失败项")
+            self.status_label.config(foreground="orange")
+        else:
+            self.status_var.set("SSO 补转完成")
+            self.status_label.config(foreground="green")
 
     def _record_failure(self, exc):
         kind = classify_failure(exc)
@@ -2145,8 +2238,10 @@ class GrokRegisterGUI:
         if self._queue_ui_call(self._set_running_ui, running):
             return
         self.is_running = running
-        self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
-        self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+        busy = running or self.sso_convert_running
+        self.start_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
+        self.sso_convert_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
         self.status_var.set("运行中..." if running else "就绪")
         self.status_label.config(foreground="blue" if running else "green")
 
@@ -2156,6 +2251,9 @@ class GrokRegisterGUI:
     def start_registration(self):
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
+            return
+        if self.sso_convert_running:
+            self.log("[!] SSO 补转正在运行，请结束后再开始注册")
             return
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
@@ -2275,6 +2373,10 @@ class GrokRegisterGUI:
         ).start()
 
     def stop_registration(self):
+        if self.sso_convert_running and not self.is_running:
+            self.sso_convert_stop_requested = True
+            self.log("[!] 用户停止 SSO 补转（当前账号完成后停止）")
+            return
         self.stop_requested = True
         # 即时写入，worker finally 能读到最新勾选状态
         config["close_browser_on_stop"] = bool(self.close_browser_on_stop_var.get())
