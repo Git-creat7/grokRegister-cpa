@@ -34,7 +34,7 @@
 - GUI + CLI 两种运行方式（CLI 仍会打开浏览器完成注册页）
 - Chromium/Chrome 自动处理 Turnstile
 - DuckMail / YYDS / Cloudflare / MailNest（Outlook）/ CloudMail 临时邮箱
-- 注册后可选开启 NSFW
+- 注册过程中可选开启 NSFW（单后台 worker，批次结束前完成本批尝试）
 - 页面卡住重试、验证码失败换邮箱、浏览器重启与内存清理
 - CLI：一次 `Ctrl+C` 安全停止，清理阶段不刷 traceback；再按一次强制中断
 
@@ -82,8 +82,10 @@ cp config.example.json config.json
 - 失败默认只警告，不强制拦截开跑
 
 **NSFW**
-- 自动开启失败**不阻塞**账号保存与 CPA 入库
-- 可网页手动开启；批量时可关掉「注册后开启 NSFW」提速
+- SSO 保存后立即进入单后台队列，不阻塞 CPA 入库和后续账号注册
+- 先走限时 HTTP 快速路径；被 Cloudflare 拦截时复用一个后台浏览器，首个账号过盾后后续账号不重复打开页面
+- 正常批次会在退出前等待本批账号得到明确成功或失败结果；失败项保留在 `nsfw_pending.txt`
+- 追求最快注册速度且不需要敏感内容时，可关闭「注册后开启 NSFW」
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
@@ -98,7 +100,7 @@ cp config.example.json config.json
 | `cloudmail_password` | CloudMail 管理员密码；也可用环境变量 `CLOUDMAIL_PASSWORD` |
 | `register_count` | 目标注册数量 |
 | `proxy` | 代理；换 token 的 OAuth 请求也走此代理 |
-| `enable_nsfw` | 注册后是否尝试开启 NSFW |
+| `enable_nsfw` | 是否在注册过程中后台开启 NSFW，并在批次结束前等待本批结果 |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
 | `cloudflare_api_key` | 默认匿名模式留空；admin 模式填 `ADMIN_PASSWORD` |
 | `cloudflare_auth_mode` | `none` / `bearer` / `x-api-key` / `x-admin-auth` / `query-key` |
@@ -343,13 +345,13 @@ curl -H "Authorization: Bearer <管理密钥>" \
 
 **开启 NSFW 时返回 403**
 
-设置出生日期可能被 `grok.com` 的 Cloudflare 防护拦截。该步骤失败不会影响账号保存和 CPA 入库；不需要敏感内容时可关闭“注册后开启 NSFW”。
+设置出生日期可能被 `grok.com` 的 Cloudflare 防护拦截。程序会先走 HTTP 快速路径，再复用一个后台浏览器过盾重试；失败不会影响账号保存和 CPA 入库，并会保留到 `nsfw_pending.txt`。不需要敏感内容时可关闭“注册后开启 NSFW”。
 
 **CLI 为什么还开浏览器**  
 CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
 
 **NSFW 失败**  
-常见为 Cloudflare 拦截。账号仍会保存并入库 CPA。
+常见为 Cloudflare 拦截。账号仍会保存并入库 CPA，失败 SSO 会保留到 `nsfw_pending.txt`。
 
 **国内服务器调模型超时**  
 入库成功只说明凭证到了 CPA；调用上游 `cli-chat-proxy.grok.com` 还需服务器出网可达（或配置 CPA `proxy-url`）。

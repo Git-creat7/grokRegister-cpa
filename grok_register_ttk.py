@@ -43,6 +43,7 @@ from email_providers.common import pick_list_payload as _pick_list
 import browser_session as _bs
 import register_flow as _rf
 import connectivity as _conn
+from nsfw_retry import NsfwRetryWorker
 from browser_session import (
     browser,
     page,
@@ -77,6 +78,8 @@ from register_flow import (
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+NSFW_PENDING_FILE = os.path.join(APP_DIR, "nsfw_pending.txt")
+NSFW_CANCEL_TIMEOUT = 15.0
 MEMORY_CLEANUP_INTERVAL = 5
 
 _session_log_path = None
@@ -1132,7 +1135,7 @@ def is_cloudflare_block_response(res):
         return False
 
 
-def set_birth_date(session, log_callback=None):
+def set_birth_date(session, log_callback=None, timeout=15):
     url = "https://grok.com/rest/auth/set-birth-date"
     new_headers = {
         "content-type": "application/json",
@@ -1141,7 +1144,7 @@ def set_birth_date(session, log_callback=None):
     }
     payload = {"birthDate": generate_random_birthdate()}
     try:
-        res = session.post(url, json=payload, headers=new_headers, timeout=15)
+        res = session.post(url, json=payload, headers=new_headers, timeout=timeout)
         body_preview = response_preview(res)
         if log_callback:
             log_callback(
@@ -1170,7 +1173,7 @@ def set_birth_date(session, log_callback=None):
         return False, f"set_birth_date 异常: {e}"
 
 
-def set_tos_accepted(session, log_callback=None):
+def set_tos_accepted(session, log_callback=None, timeout=15):
     url = "https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion"
     payload = struct.pack("B", (2 << 3) | 0) + struct.pack("B", 1)
     data = b"\x00" + struct.pack(">I", len(payload)) + payload
@@ -1182,7 +1185,7 @@ def set_tos_accepted(session, log_callback=None):
         "referer": "https://accounts.x.ai/accept-tos",
     }
     try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
+        res = session.post(url, data=data, headers=new_headers, timeout=timeout)
         if log_callback:
             log_callback(f"[Debug] set_tos_accepted status: {res.status_code}")
         if 200 <= res.status_code < 300:
@@ -1210,7 +1213,7 @@ def encode_grpc_nsfw_settings():
     return b"\x00" + struct.pack(">I", len(payload)) + payload
 
 
-def update_nsfw_settings(session, log_callback=None):
+def update_nsfw_settings(session, log_callback=None, timeout=15):
     url = "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
     data = encode_grpc_nsfw_settings()
     new_headers = {
@@ -1220,7 +1223,7 @@ def update_nsfw_settings(session, log_callback=None):
         "referer": "https://grok.com/",
     }
     try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
+        res = session.post(url, data=data, headers=new_headers, timeout=timeout)
         if log_callback:
             log_callback(
                 f"[Debug] update_nsfw status: {res.status_code}, body: {response_preview(res)}"
@@ -1240,7 +1243,12 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
-def enable_nsfw_via_browser(token="", log_callback=None, cancel_callback=None):
+def enable_nsfw_via_browser(
+    token="",
+    log_callback=None,
+    cancel_callback=None,
+    navigate=True,
+):
     """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。"""
     page_obj = _active_page()
     if page_obj is None:
@@ -1256,8 +1264,13 @@ def enable_nsfw_via_browser(token="", log_callback=None, cancel_callback=None):
     try:
         if _cancelled():
             return False, "用户已停止"
+        current_url = str(getattr(page_obj, "url", "") or "").lower()
+        should_navigate = bool(navigate or not current_url.startswith("https://grok.com"))
         if log_callback:
-            log_callback("[*] 浏览器内开启 NSFW：打开 grok.com ...")
+            if should_navigate:
+                log_callback("[*] 浏览器内开启 NSFW：打开 grok.com ...")
+            else:
+                log_callback("[*] 浏览器内开启 NSFW：复用 grok.com 会话 ...")
         # 确保 SSO cookie 在浏览器上下文中
         if token:
             try:
@@ -1283,33 +1296,34 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
                     pass
         if _cancelled():
             return False, "用户已停止"
-        page_obj.get("https://grok.com/")
-        try:
-            page_obj.wait.doc_loaded()
-        except Exception:
-            pass
-        # 等 CF 挑战结束，否则 fetch 也会拿到 Just a moment
-        for i in range(25):
-            if _cancelled():
-                return False, "用户已停止"
+        if should_navigate:
+            page_obj.get("https://grok.com/")
             try:
-                title = str(page_obj.run_js("return document.title || '';") or "").lower()
-                body = str(
-                    page_obj.run_js(
-                        "return (document.body && (document.body.innerText||'')) || '';"
-                    )
-                    or ""
-                ).lower()
-                if "just a moment" not in title and "just a moment" not in body[:200]:
-                    if "checking your browser" not in body[:300]:
-                        break
+                page_obj.wait.doc_loaded()
             except Exception:
                 pass
+            # 等 CF 挑战结束，否则 fetch 也会拿到 Just a moment
+            for _ in range(25):
+                if _cancelled():
+                    return False, "用户已停止"
+                try:
+                    title = str(page_obj.run_js("return document.title || '';") or "").lower()
+                    body = str(
+                        page_obj.run_js(
+                            "return (document.body && (document.body.innerText||'')) || '';"
+                        )
+                        or ""
+                    ).lower()
+                    if "just a moment" not in title and "just a moment" not in body[:200]:
+                        if "checking your browser" not in body[:300]:
+                            break
+                except Exception:
+                    pass
+                time.sleep(1.0)
+            else:
+                if log_callback:
+                    log_callback("[!] grok.com 仍停在 Cloudflare 挑战页，浏览器内 NSFW 可能失败")
             time.sleep(1.0)
-        else:
-            if log_callback:
-                log_callback("[!] grok.com 仍停在 Cloudflare 挑战页，浏览器内 NSFW 可能失败")
-        time.sleep(1.0)
 
         if _cancelled():
             return False, "用户已停止"
@@ -1324,10 +1338,19 @@ function b64ToBytes(b64) {
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
   return arr;
 }
+async function fetchWithTimeout(url, options, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 return (async () => {
   const out = { birthStatus: 0, birthBody: '', nsfwStatus: 0, nsfwBody: '', url: location.href };
   try {
-    const birthRes = await fetch('https://grok.com/rest/auth/set-birth-date', {
+    const birthRes = await fetchWithTimeout('https://grok.com/rest/auth/set-birth-date', {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -1344,12 +1367,12 @@ return (async () => {
   }
   const birthOk = (out.birthStatus >= 200 && out.birthStatus < 300)
     || /birth-date-change-limit-reached|Birth date is locked|already set/i.test(out.birthBody || '');
-  if (!birthOk && out.birthStatus !== 0) {
+  if (!birthOk) {
     return out;
   }
   try {
     const body = b64ToBytes(nsfwB64);
-    const nsfwRes = await fetch('https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls', {
+    const nsfwRes = await fetchWithTimeout('https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls', {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -1414,6 +1437,9 @@ def enable_nsfw_for_token(
     user_agent="",
     log_callback=None,
     cancel_callback=None,
+    allow_browser_fallback=True,
+    http_budget=None,
+    tos_only=False,
 ):
     proxies = get_proxies()
     ua = user_agent or get_user_agent()
@@ -1428,6 +1454,8 @@ def enable_nsfw_for_token(
     def _browser_fallback(reason):
         if _cancelled():
             return False, "用户已停止"
+        if not allow_browser_fallback:
+            return False, reason
         if _active_page() is None:
             return False, reason
         if log_callback:
@@ -1444,6 +1472,16 @@ def enable_nsfw_for_token(
     try:
         if _cancelled():
             return False, "用户已停止"
+        deadline = None
+        if http_budget is not None:
+            deadline = time.monotonic() + max(float(http_budget), 0.1)
+
+        def _request_timeout():
+            if deadline is None:
+                return 15.0
+            remaining = deadline - time.monotonic()
+            return min(15.0, remaining) if remaining > 0 else 0.0
+
         if log_callback:
             log_callback("[*] NSFW 先尝试 HTTP 快速路径...")
         with requests.Session(impersonate="chrome120", proxies=proxies) as session:
@@ -1458,22 +1496,143 @@ def enable_nsfw_for_token(
                     "accept-language": "en-US,en;q=0.9",
                 }
             )
-            ok, message = set_tos_accepted(session, log_callback)
+            timeout = _request_timeout()
+            if timeout <= 0:
+                return _browser_fallback("NSFW HTTP 快速路径超时")
+            ok, message = set_tos_accepted(session, log_callback, timeout=timeout)
+            if not ok:
+                return _browser_fallback(message)
+            if tos_only:
+                return True, "TOS 已确认"
+            if _cancelled():
+                return False, "用户已停止"
+            timeout = _request_timeout()
+            if timeout <= 0:
+                return _browser_fallback("NSFW HTTP 快速路径超时")
+            ok, message = set_birth_date(session, log_callback, timeout=timeout)
             if not ok:
                 return _browser_fallback(message)
             if _cancelled():
                 return False, "用户已停止"
-            ok, message = set_birth_date(session, log_callback)
-            if not ok:
-                return _browser_fallback(message)
-            if _cancelled():
-                return False, "用户已停止"
-            ok, message = update_nsfw_settings(session, log_callback)
+            timeout = _request_timeout()
+            if timeout <= 0:
+                return _browser_fallback("NSFW HTTP 快速路径超时")
+            ok, message = update_nsfw_settings(session, log_callback, timeout=timeout)
             if not ok:
                 return _browser_fallback(message)
             return True, "成功开启 NSFW（HTTP 快速路径）"
     except Exception as e:
         return _browser_fallback(f"HTTP 快速路径异常: {e}")
+
+
+def enable_nsfw_with_reused_browser(
+    sso,
+    *,
+    log_callback=print,
+    should_stop=None,
+    attempts=2,
+    retry_delay=8.0,
+):
+    """在后台复用一个浏览器补开；CF 拦截时保留会话后重试。"""
+
+    def stopped():
+        return bool(should_stop and should_stop())
+
+    if stopped():
+        return False, "用户已停止"
+    if _active_page() is None:
+        start_browser(log_callback=log_callback, cancel_callback=stopped)
+    if stopped():
+        return False, "用户已停止"
+    last_result = (False, "浏览器补开未执行")
+    attempt_count = max(int(attempts or 1), 1)
+    for attempt in range(1, attempt_count + 1):
+        if stopped():
+            return False, "用户已停止"
+        page_obj = _active_page()
+        current_url = str(getattr(page_obj, "url", "") or "").lower()
+        navigate = attempt > 1 or not current_url.startswith("https://grok.com")
+        last_result = enable_nsfw_via_browser(
+            token=sso,
+            log_callback=log_callback,
+            cancel_callback=stopped,
+            navigate=navigate,
+        )
+        if last_result[0]:
+            return last_result
+        message = str(last_result[1] or "")
+        cf_blocked = "cf" in message.lower() or "403" in message
+        if not cf_blocked or attempt >= attempt_count:
+            return last_result
+        if log_callback:
+            log_callback(
+                f"[NSFW] 浏览器仍被 CF 拦截，保留会话后重试 ({attempt}/{attempt_count})"
+            )
+        deadline = time.monotonic() + max(float(retry_delay), 0)
+        while time.monotonic() < deadline:
+            if stopped():
+                return False, "用户已停止"
+            time.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
+        if stopped():
+            return False, "用户已停止"
+    return last_result
+
+
+def create_nsfw_retry_worker(
+    log_callback=print,
+    idle_timeout=90.0,
+    cancel_callback=None,
+):
+    """创建单浏览器 NSFW 补开 worker；供 GUI 和自用脚本复用。"""
+
+    def nsfw_log(message):
+        if log_callback:
+            log_callback(str(message))
+
+    def retry(email, sso, worker_should_stop):
+        def should_stop():
+            return bool(
+                worker_should_stop()
+                or (cancel_callback and cancel_callback())
+            )
+
+        page_obj = _active_page()
+        current_url = str(getattr(page_obj, "url", "") or "").lower()
+        browser_ready = current_url.startswith("https://grok.com")
+        ok, message = enable_nsfw_for_token(
+            sso,
+            log_callback=nsfw_log,
+            cancel_callback=should_stop,
+            allow_browser_fallback=False,
+            http_budget=8,
+            tos_only=browser_ready,
+        )
+        if should_stop():
+            return ok, message
+        if ok and not browser_ready:
+            return True, message
+        if browser_ready:
+            if not ok:
+                nsfw_log(f"[NSFW] TOS 快速路径未成功，仍复用浏览器: {message}")
+            return enable_nsfw_with_reused_browser(
+                sso,
+                log_callback=nsfw_log,
+                should_stop=should_stop,
+            )
+        nsfw_log(f"[NSFW] HTTP 未成功，转复用浏览器: {message}")
+        return enable_nsfw_with_reused_browser(
+            sso,
+            log_callback=nsfw_log,
+            should_stop=should_stop,
+        )
+
+    return NsfwRetryWorker(
+        NSFW_PENDING_FILE,
+        retry,
+        cleanup_callback=stop_browser,
+        log=nsfw_log,
+        idle_timeout=idle_timeout,
+    )
 
 
 # browser session state -> browser_session
@@ -1644,10 +1803,15 @@ class GrokRegisterGUI:
         self.stop_requested = False
         self.ui_queue = queue.Queue()
         self.accounts_output_file = ""
+        self.nsfw_retry_worker = None
+        self._closing = False
         self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._drain_ui_queue)
 
     def _queue_ui_call(self, callback, *args):
+        if getattr(self, "_closing", False):
+            return True
         if threading.get_ident() == self._ui_thread_id:
             return False
         self.ui_queue.put((callback, args))
@@ -2322,6 +2486,68 @@ class GrokRegisterGUI:
     def should_stop(self):
         return self.stop_requested or not self.is_running
 
+    def _get_nsfw_retry_worker(self):
+        worker = getattr(self, "nsfw_retry_worker", None)
+        if worker is None:
+            worker = create_nsfw_retry_worker(
+                log_callback=self.log,
+                cancel_callback=self.should_stop,
+            )
+            self.nsfw_retry_worker = worker
+        return worker
+
+    def _submit_nsfw(self, email, sso, log_callback=None):
+        log_callback = log_callback or self.log
+        try:
+            queued = self._get_nsfw_retry_worker().submit(email, sso)
+        except Exception as exc:
+            log_callback(f"[NSFW] [!] 加入本批队列失败，账号仍继续入库: {exc}")
+            return False
+        if queued:
+            log_callback("[*] 6. NSFW 已进入本批后台队列")
+        else:
+            log_callback("[NSFW] [!] 未加入本批队列，已保留 pending")
+        return queued
+
+    def _finish_nsfw_batch(self):
+        worker = getattr(self, "nsfw_retry_worker", None)
+        if worker is None:
+            return None
+        try:
+            if self.stop_requested:
+                summary = worker.cancel(wait=True, timeout=NSFW_CANCEL_TIMEOUT)
+            else:
+                pending = worker.pending_tasks()
+                if pending:
+                    self.log(f"[NSFW] 注册账号已处理完，等待本批 NSFW 完成（剩余 {pending}）")
+                summary = worker.finish()
+            submitted = int(summary.get("submitted", 0))
+            if submitted:
+                self.log(
+                    f"[NSFW] 本批结束：成功 {summary.get('succeeded', 0)} | "
+                    f"失败 {summary.get('failed', 0)} | "
+                    f"未尝试 {summary.get('cancelled', 0)}"
+                )
+            if not summary.get("worker_stopped", True):
+                self.log("[NSFW] [!] 停止等待已超时，后台清理仍会继续")
+            return summary
+        finally:
+            self.nsfw_retry_worker = None
+
+    def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.stop_requested = True
+        config["close_browser_on_stop"] = True
+        worker = getattr(self, "nsfw_retry_worker", None)
+        if worker is not None:
+            worker.cancel(wait=True, timeout=5.0)
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
     def start_registration(self):
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
@@ -2416,6 +2642,13 @@ class GrokRegisterGUI:
         self._set_running_ui(True)
         self._stats_lock = threading.Lock()
         self._accounts_lock = threading.Lock()
+        if config.get("enable_nsfw", True):
+            self.nsfw_retry_worker = create_nsfw_retry_worker(
+                log_callback=self.log,
+                cancel_callback=self.should_stop,
+            )
+        else:
+            self.nsfw_retry_worker = None
         # 启动前快速连通性检查（失败仍可继续，只警告）
         try:
             checks = _conn.run_connectivity_checks(config, http_get, http_post)
@@ -2451,6 +2684,9 @@ class GrokRegisterGUI:
         if self.stop_requested:
             return
         self.stop_requested = True
+        worker = getattr(self, "nsfw_retry_worker", None)
+        if worker is not None:
+            worker.cancel(wait=False)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_var.set("正在停止...")
         self.status_label.config(foreground="orange")
@@ -2492,6 +2728,10 @@ class GrokRegisterGUI:
                         t.join(timeout=0.2)
         finally:
             # 协调线程自身无浏览器；各 worker 线程 finally 已各自 stop
+            try:
+                self._finish_nsfw_batch()
+            except Exception as exc:
+                self.log(f"[NSFW] [!] 本批收尾异常: {exc}")
             self._set_running_ui(False)
             self.log(
                 f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
@@ -2510,7 +2750,10 @@ class GrokRegisterGUI:
 
         try:
             try:
-                start_browser(log_callback=wlog)
+                start_browser(
+                    log_callback=wlog,
+                    cancel_callback=self.should_stop,
+                )
             except Exception as boot_exc:
                 streak = get_start_fail_streak()
                 wlog(f"[-] 浏览器启动失败 (连续失败 {streak}): {boot_exc}")
@@ -2568,7 +2811,10 @@ class GrokRegisterGUI:
                             msg = str(mail_exc)
                             if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                                 wlog(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(log_callback=wlog)
+                                restart_browser(
+                                    log_callback=wlog,
+                                    cancel_callback=self.should_stop,
+                                )
                                 sleep_with_cancel(1, self.should_stop)
                                 continue
                             raise
@@ -2585,20 +2831,6 @@ class GrokRegisterGUI:
                     sso = wait_for_sso_cookie(
                         log_callback=wlog, cancel_callback=self.should_stop
                     )
-                    if config.get("enable_nsfw", True):
-                        wlog("[*] 6. 开启 NSFW（失败不阻塞入库）")
-                        try:
-                            nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                                sso,
-                                log_callback=wlog,
-                                cancel_callback=self.should_stop,
-                            )
-                            if nsfw_ok:
-                                wlog(f"[+] NSFW 开启成功: {nsfw_msg}")
-                            else:
-                                wlog(f"[!] NSFW 自动开启失败（账号仍可用，可网页手动开）: {nsfw_msg}")
-                        except Exception as nsfw_exc:
-                            wlog(f"[!] NSFW 步骤异常，已跳过: {nsfw_exc}")
                     try:
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
                         alock = getattr(self, "_accounts_lock", None)
@@ -2619,6 +2851,8 @@ class GrokRegisterGUI:
                             self.results.append({"email": email, "sso": sso, "profile": profile})
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
+                    if config.get("enable_nsfw", True):
+                        self._submit_nsfw(email, sso, log_callback=wlog)
                     cpa_ok = add_sso_to_cpa(
                         sso,
                         email=email,
@@ -2718,6 +2952,9 @@ def cli_log(message):
 
 def run_registration_cli(count):
     controller = CliStopController()
+    nsfw_worker = None
+    sigint_received = False
+    sigint_notice_logged = False
 
     # 一次 Ctrl+C 可靠置停：SIGINT 处理器直接设停止标志，不依赖异常在
     # curl_cffi C 回调里向上传播（那里 KeyboardInterrupt 会被吞掉，导致
@@ -2726,12 +2963,13 @@ def run_registration_cli(count):
     _prev_sigint = signal.getsignal(signal.SIGINT)
 
     def _on_sigint(signum, frame):
+        nonlocal sigint_received
         if controller.should_stop():
             # 第二次：恢复默认并重新抛出，强制中断
             signal.signal(signal.SIGINT, _prev_sigint)
             raise KeyboardInterrupt
         controller.stop()
-        cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
+        sigint_received = True
 
     signal.signal(signal.SIGINT, _on_sigint)
     success_count = 0
@@ -2747,6 +2985,58 @@ def run_registration_cli(count):
     cli_log(f"[*] 终端模式启动，目标数量: {count} | 并发: {workers}")
     cli_log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
+    if config.get("enable_nsfw", True):
+        nsfw_worker = create_nsfw_retry_worker(
+            log_callback=cli_log,
+            cancel_callback=controller.should_stop,
+        )
+
+    def _emit_sigint_notice():
+        nonlocal sigint_notice_logged
+        if sigint_received and not sigint_notice_logged:
+            sigint_notice_logged = True
+            cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
+
+    def _submit_cli_nsfw(email, sso, prefix=""):
+        if nsfw_worker is None:
+            return False
+        try:
+            queued = nsfw_worker.submit(email, sso)
+        except Exception as exc:
+            cli_log(f"{prefix}[NSFW] [!] 加入本批队列失败，账号仍继续入库: {exc}")
+            return False
+        if queued:
+            cli_log(f"{prefix}[*] NSFW 已进入本批后台队列")
+        else:
+            cli_log(f"{prefix}[NSFW] [!] 未加入本批队列，已保留 pending")
+        return queued
+
+    def _finish_cli_nsfw():
+        nonlocal nsfw_worker
+        _emit_sigint_notice()
+        worker = nsfw_worker
+        if worker is None:
+            return None
+        try:
+            if controller.should_stop():
+                summary = worker.cancel(wait=True, timeout=NSFW_CANCEL_TIMEOUT)
+            else:
+                pending = worker.pending_tasks()
+                if pending:
+                    cli_log(f"[NSFW] 注册账号已处理完，等待本批 NSFW 完成（剩余 {pending}）")
+                summary = worker.finish()
+            submitted = int(summary.get("submitted", 0))
+            if submitted:
+                cli_log(
+                    f"[NSFW] 本批结束：成功 {summary.get('succeeded', 0)} | "
+                    f"失败 {summary.get('failed', 0)} | "
+                    f"未尝试 {summary.get('cancelled', 0)}"
+                )
+            if not summary.get("worker_stopped", True):
+                cli_log("[NSFW] [!] 停止等待已超时，后台清理仍会继续")
+            return summary
+        finally:
+            nsfw_worker = None
 
     def _cli_record_failure(exc):
         nonlocal fail_count
@@ -2770,7 +3060,10 @@ def run_registration_cli(count):
             local_fail_stats = empty_fail_stats()
             try:
                 try:
-                    start_browser(log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"))
+                    start_browser(
+                        log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                        cancel_callback=controller.should_stop,
+                    )
                 except Exception as boot_exc:
                     local_fail = n
                     local_fail_stats[FAIL_BROWSER] = local_fail_stats.get(FAIL_BROWSER, 0) + n
@@ -2802,12 +3095,6 @@ def run_registration_cli(count):
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
-                        if config.get("enable_nsfw", True):
-                            enable_nsfw_for_token(
-                                sso,
-                                log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                                cancel_callback=controller.should_stop,
-                            )
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
                         try:
                             with accounts_lock:
@@ -2823,6 +3110,7 @@ def run_registration_cli(count):
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
                             raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                        _submit_cli_nsfw(email, sso, prefix=f"[W{wid+1}] ")
                         cpa_ok = add_sso_to_cpa(
                             sso,
                             email=email,
@@ -2895,6 +3183,7 @@ def run_registration_cli(count):
         except KeyboardInterrupt:
             controller.stop()
             cli_log("[!] 强制中断多并发任务")
+            _finish_cli_nsfw()
             try:
                 signal.signal(signal.SIGINT, _prev_sigint)
             except Exception:
@@ -2903,6 +3192,7 @@ def run_registration_cli(count):
         success_count = shared["success"]
         fail_count = shared["fail"]
         fail_stats = shared["fail_stats"]
+        _finish_cli_nsfw()
         cli_log(
             f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
             + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
@@ -2915,7 +3205,10 @@ def run_registration_cli(count):
 
     try:
         try:
-            start_browser(log_callback=cli_log)
+            start_browser(
+                log_callback=cli_log,
+                cancel_callback=controller.should_stop,
+            )
         except Exception as boot_exc:
             fail_count += count
             fail_stats[FAIL_BROWSER] = fail_stats.get(FAIL_BROWSER, 0) + count
@@ -2967,7 +3260,10 @@ def run_registration_cli(count):
                         msg = str(mail_exc)
                         if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                             cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(log_callback=cli_log)
+                            restart_browser(
+                                log_callback=cli_log,
+                                cancel_callback=controller.should_stop,
+                            )
                             sleep_with_cancel(1, controller.should_stop)
                             continue
                         raise
@@ -2984,17 +3280,6 @@ def run_registration_cli(count):
                 sso = wait_for_sso_cookie(
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
-                if config.get("enable_nsfw", True):
-                    cli_log("[*] 6. 开启 NSFW")
-                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso,
-                        log_callback=cli_log,
-                        cancel_callback=controller.should_stop,
-                    )
-                    if nsfw_ok:
-                        cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                    else:
-                        cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                 try:
                     line = f"{email}----{profile.get('password','')}----{sso}\n"
                     with open(accounts_output_file, "a", encoding="utf-8") as f:
@@ -3003,6 +3288,7 @@ def run_registration_cli(count):
                     cli_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                     _append_sso_pending(email, sso, log_callback=cli_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                _submit_cli_nsfw(email, sso)
                 cpa_ok = add_sso_to_cpa(
                     sso,
                     email=email,
@@ -3075,6 +3361,10 @@ def run_registration_cli(count):
     except Exception as exc:
         cli_log(f"[!] 任务异常: {exc}")
     finally:
+        try:
+            _finish_cli_nsfw()
+        except BaseException as exc:
+            cli_log(f"[NSFW] [!] 本批收尾异常: {exc}")
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except Exception:

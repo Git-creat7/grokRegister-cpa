@@ -33,3 +33,7 @@ token.json
 .vscode/
 DrissionPage/
 autoPortData/
+.gstack/
+/nsfw_pending.txt
+/nsfw_pending.txt.lock
+/nsfw_pending.txt.tmp

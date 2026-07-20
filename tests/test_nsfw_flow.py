@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import grok_register_ttk as app
@@ -63,6 +64,100 @@ class NsfwFlowTests(unittest.TestCase):
             cancel_callback=None,
         )
         clearance_scan.assert_not_called()
+
+    def test_fast_only_failure_does_not_open_browser(self):
+        with patch.object(app.requests, "Session", return_value=self._session_context()), patch.object(
+            app,
+            "set_tos_accepted",
+            return_value=(False, "HTTP 403"),
+        ) as set_tos, patch.object(app, "enable_nsfw_via_browser") as browser_fallback:
+            ok, message = app.enable_nsfw_for_token(
+                "sso-token",
+                allow_browser_fallback=False,
+                http_budget=8,
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(message, "HTTP 403")
+        self.assertLessEqual(set_tos.call_args.kwargs["timeout"], 8)
+        browser_fallback.assert_not_called()
+
+    def test_tos_only_skips_birth_and_settings_requests(self):
+        with patch.object(app.requests, "Session", return_value=self._session_context()), patch.object(
+            app, "set_tos_accepted", return_value=(True, "ok")
+        ), patch.object(app, "set_birth_date") as set_birth, patch.object(
+            app, "update_nsfw_settings"
+        ) as update_nsfw:
+            ok, message = app.enable_nsfw_for_token(
+                "sso-token",
+                allow_browser_fallback=False,
+                tos_only=True,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "TOS 已确认")
+        set_birth.assert_not_called()
+        update_nsfw.assert_not_called()
+
+    def test_reused_browser_retries_cloudflare_failure(self):
+        page = SimpleNamespace(url="about:blank")
+        with patch.object(app, "_active_page", return_value=page), patch.object(
+            app,
+            "enable_nsfw_via_browser",
+            side_effect=[(False, "CF HTTP 403"), (True, "ok")],
+        ) as browser_enable:
+            ok, message = app.enable_nsfw_with_reused_browser(
+                "sso-token",
+                log_callback=lambda _: None,
+                attempts=2,
+                retry_delay=0,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "ok")
+        self.assertEqual(browser_enable.call_count, 2)
+        self.assertTrue(browser_enable.call_args_list[0].kwargs["navigate"])
+        self.assertTrue(browser_enable.call_args_list[1].kwargs["navigate"])
+
+    def test_reused_browser_skips_navigation_for_warm_grok_page(self):
+        page = SimpleNamespace(url="https://grok.com/")
+        with patch.object(app, "_active_page", return_value=page), patch.object(
+            app,
+            "enable_nsfw_via_browser",
+            return_value=(True, "ok"),
+        ) as browser_enable, patch.object(app, "start_browser") as start_browser:
+            ok, message = app.enable_nsfw_with_reused_browser(
+                "sso-token",
+                log_callback=lambda _: None,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "ok")
+        self.assertFalse(browser_enable.call_args.kwargs["navigate"])
+        start_browser.assert_not_called()
+
+    def test_worker_uses_tos_only_when_browser_is_warm(self):
+        page = SimpleNamespace(url="https://grok.com/")
+        with patch.object(app, "_active_page", return_value=page), patch.object(
+            app,
+            "enable_nsfw_for_token",
+            return_value=(True, "TOS 已确认"),
+        ) as http_enable, patch.object(
+            app,
+            "enable_nsfw_with_reused_browser",
+            return_value=(True, "ok"),
+        ) as browser_enable:
+            worker = app.create_nsfw_retry_worker(log_callback=lambda _: None)
+            ok, message = worker.retry_callback(
+                "user@example.com",
+                "sso-token",
+                lambda: False,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(message, "ok")
+        self.assertTrue(http_enable.call_args.kwargs["tos_only"])
+        browser_enable.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -317,14 +317,22 @@ def create_browser_options(unique_profile=True):
     return options
 
 
-def start_browser(log_callback=None) -> Tuple[object, object]:
+def start_browser(log_callback=None, cancel_callback=None) -> Tuple[object, object]:
+    def cancelled():
+        return bool(cancel_callback and cancel_callback())
+
     last_exc = None
     for attempt in range(1, 5):
+        if cancelled():
+            raise RuntimeError("用户已停止")
+        browser_obj = None
         try:
             previous_foreground = 0
             if _keep_windows_background and os.name == "nt":
                 previous_foreground = _get_foreground_window()
             browser_obj = Chromium(create_browser_options(unique_profile=True))
+            if cancelled():
+                raise RuntimeError("用户已停止")
             tabs = browser_obj.get_tabs()
             page_obj = tabs[-1] if tabs else browser_obj.new_tab()
             set_browser_session(browser_obj, page_obj)
@@ -349,12 +357,20 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次, 连续失败{streak}): {exc}")
             try:
                 cur = active_browser()
+                if cur is None:
+                    cur = browser_obj
                 if cur is not None:
                     cur.quit(del_data=True)
             except Exception:
                 pass
             set_browser_session(None, None)
-            time.sleep(min(1.5 * attempt, 4))
+            if cancelled():
+                raise RuntimeError("用户已停止") from exc
+            deadline = time.monotonic() + min(1.5 * attempt, 4)
+            while time.monotonic() < deadline:
+                if cancelled():
+                    raise RuntimeError("用户已停止") from exc
+                time.sleep(min(0.1, max(deadline - time.monotonic(), 0)))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
@@ -370,9 +386,12 @@ def stop_browser():
         pass
 
 
-def restart_browser(log_callback=None):
+def restart_browser(log_callback=None, cancel_callback=None):
     stop_browser()
-    return start_browser(log_callback=log_callback)
+    return start_browser(
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):

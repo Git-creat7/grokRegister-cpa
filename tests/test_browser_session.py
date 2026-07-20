@@ -51,6 +51,26 @@ class BrowserSessionTests(unittest.TestCase):
                 bs.start_browser(log_callback=None)
         self.assertGreaterEqual(bs.get_start_fail_streak(), before + 1)
 
+    def test_start_browser_honors_pre_cancel(self):
+        with patch.object(bs, "Chromium") as chromium:
+            with self.assertRaisesRegex(RuntimeError, "用户已停止"):
+                bs.start_browser(cancel_callback=lambda: True)
+        chromium.assert_not_called()
+
+    def test_start_browser_stops_retrying_after_cancel(self):
+        cancelled = False
+
+        def fail_once(options):
+            nonlocal cancelled
+            cancelled = True
+            raise RuntimeError("boom")
+
+        with patch.object(bs, "Chromium", side_effect=fail_once) as chromium:
+            with self.assertRaisesRegex(RuntimeError, "用户已停止"):
+                bs.start_browser(cancel_callback=lambda: cancelled)
+
+        chromium.assert_called_once()
+
     def test_stop_browser_always_quits(self):
         mock_browser = MagicMock()
         bs.set_browser_session(mock_browser, object())
