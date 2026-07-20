@@ -671,14 +671,19 @@ def upload_cpa_auth_remote(
     management_key: str,
     record: dict,
     timeout: int = 30,
+    proxy: str = "",
 ) -> str:
     """通过 CPA Management API 上传 auth 文件到远程实例。
 
     POST /v0/management/auth-files?name=<file.json>
     Header: Authorization: Bearer <management_key>
     Body: raw JSON auth record
+
+    proxy 策略与 connectivity.check_cpa 一致：公网走 proxy，本机/局域网强制直连。
     """
     import requests
+
+    import connectivity as _conn
 
     base = str(base_url or "").strip().rstrip("/")
     key = str(management_key or "").strip()
@@ -689,6 +694,8 @@ def upload_cpa_auth_remote(
 
     name = cpa_auth_filename(record)
     url = f"{base}/v0/management/auth-files"
+    host = (urllib.parse.urlparse(base).hostname or "127.0.0.1").lower()
+    proxies = _conn.proxies_for_cpa_host(host, proxy)
     resp = requests.post(
         url,
         params={"name": name},
@@ -698,6 +705,7 @@ def upload_cpa_auth_remote(
         },
         data=json.dumps(record, ensure_ascii=False).encode("utf-8"),
         timeout=timeout,
+        proxies=proxies,
     )
     if resp.status_code >= 400:
         body = (resp.text or "").strip()
@@ -840,19 +848,25 @@ def collect_remote_auth_emails(
     base_url: str,
     management_key: str,
     timeout: int = 15,
+    proxy: str = "",
 ) -> set[str]:
     """通过 CPA Management API 获取远程已存在的 auth 邮箱。"""
     import requests
+
+    import connectivity as _conn
 
     base = str(base_url or "").strip().rstrip("/")
     key = str(management_key or "").strip()
     if not base or not key:
         return set()
     try:
+        host = (urllib.parse.urlparse(base).hostname or "127.0.0.1").lower()
+        proxies = _conn.proxies_for_cpa_host(host, proxy)
         response = requests.get(
             f"{base}/v0/management/auth-files",
             headers={"Authorization": f"Bearer {key}"},
             timeout=timeout,
+            proxies=proxies,
         )
         response.raise_for_status()
         payload = response.json()
@@ -933,6 +947,7 @@ def convert_sso_entries(
         existing_emails = collect_remote_auth_emails(
             cpa_remote_url,
             str(cpa_management_key or ""),
+            proxy=proxy,
         )
     else:
         existing_emails = local_emails
@@ -1018,6 +1033,7 @@ def convert_sso_entries(
                         cpa_remote_url,
                         str(cpa_management_key or ""),
                         record,
+                        proxy=proxy,
                     )
                     _log(
                         f"💾 CPA 远程 → {cpa_remote_url.rstrip('/')}/.../{name}",

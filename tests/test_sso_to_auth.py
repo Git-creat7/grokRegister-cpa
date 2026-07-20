@@ -312,6 +312,55 @@ class ExtractNextActionTests(unittest.TestCase):
         consent_headers = session.posts[0][1]["headers"]
         self.assertEqual(consent_headers["Next-Action"], s2a.NEXT_ACTION_ID)
 
+    def test_upload_cpa_auth_remote_uses_proxy_for_public_host(self):
+        captured = {}
+
+        class FakeResp:
+            status_code = 200
+            text = "ok"
+            reason = "OK"
+
+        def fake_post(url, **kwargs):
+            captured.update(kwargs)
+            return FakeResp()
+
+        with patch("requests.post", side_effect=fake_post):
+            name = s2a.upload_cpa_auth_remote(
+                "https://2api.example.com",
+                "mgmt-key",
+                {"email": "a@b.com", "access_token": "t"},
+                proxy="http://127.0.0.1:10808",
+            )
+        self.assertTrue(name.endswith(".json"))
+        self.assertEqual(
+            captured.get("proxies"),
+            {
+                "http": "http://127.0.0.1:10808",
+                "https": "http://127.0.0.1:10808",
+            },
+        )
+
+    def test_upload_cpa_auth_remote_forces_direct_for_localhost(self):
+        captured = {}
+
+        class FakeResp:
+            status_code = 200
+            text = "ok"
+            reason = "OK"
+
+        def fake_post(url, **kwargs):
+            captured.update(kwargs)
+            return FakeResp()
+
+        with patch("requests.post", side_effect=fake_post):
+            s2a.upload_cpa_auth_remote(
+                "http://127.0.0.1:8317",
+                "mgmt-key",
+                {"email": "a@b.com", "access_token": "t"},
+                proxy="http://127.0.0.1:10808",
+            )
+        self.assertEqual(captured.get("proxies"), {})
+
 
 if __name__ == "__main__":
     unittest.main()
