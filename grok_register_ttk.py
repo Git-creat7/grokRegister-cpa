@@ -553,7 +553,9 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
                 _cpa_log("用户停止，跳过远程上传")
                 return wrote_ok
             try:
-                name = _s2cpa.upload_cpa_auth_remote(remote_url, management_key, record)
+                name = _s2cpa.upload_cpa_auth_remote(
+                    remote_url, management_key, record, proxy=proxy
+                )
                 _cpa_log(f"已上传远程 {remote_url.rstrip('/')}/.../{name}")
                 wrote_ok = True
             except Exception as remote_exc:

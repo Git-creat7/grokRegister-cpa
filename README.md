@@ -79,6 +79,8 @@ cp config.example.json config.json
 **连通性检查**
 - GUI「连通性检查」或开始注册前自动跑
 - 检查项：代理 TCP/出站、邮箱 API、CPA 本地目录/远程 Management API
+- Cloudflare：`/api/domains` 失败时回退探测 `/open_api/settings`；非 admin 的 `/new_address` 直建模式不依赖 domains
+- 远程 CPA：公网地址若配置了 `proxy`（或环境代理）则经代理探测/上传；`127.0.0.1` / 局域网强制直连
 - 失败默认只警告，不强制拦截开跑
 
 **NSFW**
@@ -97,7 +99,7 @@ cp config.example.json config.json
 | `cloudmail_admin_email` | CloudMail 管理员邮箱；也可用环境变量 `CLOUDMAIL_ADMIN_EMAIL` |
 | `cloudmail_password` | CloudMail 管理员密码；也可用环境变量 `CLOUDMAIL_PASSWORD` |
 | `register_count` | 目标注册数量 |
-| `proxy` | 代理；换 token 的 OAuth 请求也走此代理 |
+| `proxy` | 代理；OAuth 换 token、公网远程 CPA 探测/上传均走此代理（本机/局域网 CPA 除外） |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
 | `cloudflare_api_key` | 默认匿名模式留空；admin 模式填 `ADMIN_PASSWORD` |
