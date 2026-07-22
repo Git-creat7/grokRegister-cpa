@@ -184,7 +184,15 @@ class CloudMailTests(unittest.TestCase):
             {
                 "emailId": "mail-1",
                 "subject": "Your xAI verification code",
-                "content": "<p>Verification code: <strong>123456</strong></p>",
+                "content": (
+                    "<!doctype html><html><head><style>"
+                    ".per-100 { width: 100% !important; }"
+                    "</style></head><body>"
+                    '<table class="per-100"><tr>'
+                    '<td style="text-align: center; background: #FAFAFA; '
+                    'padding: 30px 20px; font-size: 26px; font-weight: bold;">'
+                    "5LE-AXU</td></tr></table></body></html>"
+                ),
             }
         ]
 
@@ -199,7 +207,7 @@ class CloudMailTests(unittest.TestCase):
                 "ignored", email, timeout=1, poll_interval=0
             )
 
-        self.assertEqual(code, "123456")
+        self.assertEqual(code, "5LE-AXU")
         email_list.assert_called_once_with(
             app.http_post,
             "https://mail.example.com",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from html.parser import HTMLParser
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from email_providers.common import extract_verification_code, generate_username
@@ -19,6 +20,35 @@ _public_token_config = None
 _public_token_lock = threading.Lock()
 _account_ids: Dict[str, Any] = {}
 _account_ids_lock = threading.Lock()
+
+
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._hidden_depth = 0
+        self.parts: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() in {"style", "script", "head"}:
+            self._hidden_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"style", "script", "head"} and self._hidden_depth:
+            self._hidden_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._hidden_depth and data.strip():
+            self.parts.append(data)
+
+
+def _visible_text(value: str) -> str:
+    parser = _VisibleTextParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", value)
+    return " ".join(parser.parts)
 
 
 def reset_runtime_state() -> None:
@@ -286,10 +316,10 @@ def wait_for_code(
                         parts.append(value)
                 html_value = msg.get("html") or msg.get("htmlContent") or msg.get("html_content")
                 if isinstance(html_value, str):
-                    parts.append(re.sub(r"<[^>]+>", " ", html_value))
+                    parts.append(_visible_text(html_value))
                 elif isinstance(html_value, list):
                     parts.extend(
-                        re.sub(r"<[^>]+>", " ", item)
+                        _visible_text(item)
                         for item in html_value
                         if isinstance(item, str)
                     )
@@ -297,8 +327,8 @@ def wait_for_code(
                 if log_callback:
                     log_callback(f"[Debug] CloudMail 收到邮件: {subject}")
                 combined = "\n".join(parts)
-                plain_text = re.sub(r"<[^>]+>", " ", combined)
-                code = extract_verification_code(f"{combined}\n{plain_text}", subject)
+                plain_text = _visible_text(combined)
+                code = extract_verification_code(plain_text, subject)
                 if code:
                     if log_callback:
                         log_callback(f"[*] CloudMail 从邮件中提取到验证码: {code}")
