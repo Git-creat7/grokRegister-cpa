@@ -21,29 +21,38 @@
 
 ## 核心流程
 
+**默认：协议 HTTP 注册**（`register_mode=protocol`，不打开注册页）：
+
 ```text
-打开注册页 → 创建临时邮箱 → 收验证码 → 填资料 / 过人机验证
-   → 拿到 SSO cookie → 授权码流程换 OAuth token（带 referrer=grok-build）
-   → 本地写入 cpa_auth_dir  和/或  POST 远程 CPA Management API
-   → CPA 热加载，立即可用
+Fetch signup config（进程内缓存）
+   → Turnstile mint（屏外 headed Chrome）∥ 建邮 + 发码 + 等码
+   → VerifyEmailCode → SignupServerAction → SSO
+   → Device Authorization Flow 换 OAuth（无 referrer / 无 bot_flag）
+   → 本地 cpa_auth_dir 和/或 远程 CPA Management API
+   → probe cli-chat-proxy.grok.com 测活
 ```
+
+批量（`count≥2`）走 **S/P/C/O 流水线**：S 预 mint、P 建邮等码、C 注册出 SSO、O 做 CPA/写盘；阶段重叠提高吞吐。
+
+可选：`register_mode=browser` 回退旧 UI 注册页（易带 `bot_flag_source`，测活可能 402）。
 
 ## 功能
 
+- **协议 HTTP 注册**（默认）：无注册页浏览器；Turnstile 仅屏外 mint；健康 JWT（无 `referrer` / 无 `bot_flag`）
+- 批量 **S/P/C/O 流水线** + 进程内 signup config 缓存 + 单号 Turnstile∥建邮并行
 - 注册成功后自动入库 CPA（本地目录 / 远程 Management API，可同时开）
-- GUI + CLI 两种运行方式（CLI 仍会打开浏览器完成注册页）
-- Chromium/Chrome 自动处理 Turnstile
+- GUI + CLI；Device Flow 换 token（不再强制 `referrer=grok-build`）
 - DuckMail / YYDS / Cloudflare / MailNest（Outlook）/ CloudMail 临时邮箱
-- 注册过程中可选开启 NSFW（单后台 worker，批次结束前完成本批尝试）
-- 页面卡住重试、验证码失败换邮箱、浏览器重启与内存清理
+- 可选 NSFW：批内**纯 HTTP 后台队列**（不冷启浏览器、不抢 Turnstile 代理）；失败进 `nsfw_pending.txt`，可用 `cmd/retry_pending_nsfw.py` 离线补开
+- 页面卡住重试、验证码失败换邮箱；browser 模式仍支持浏览器重启与内存清理
 - CLI：一次 `Ctrl+C` 安全停止，清理阶段不刷 traceback；再按一次强制中断
 
 ## 环境要求
 
 - Python 3.9+
-- Google Chrome 或 Chromium
+- Google Chrome 或 Chromium（协议模式仅用于 Turnstile mint；NSFW 批内默认不开浏览器）
 - 可用的 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-- 能访问注册页、临时邮箱 API、`auth.x.ai` 的网络（授权码流程换 token 需要）
+- 能访问 `accounts.x.ai`、临时邮箱 API、`auth.x.ai` / `cli-chat-proxy.grok.com` 的网络
 
 ## 安装
 
@@ -65,27 +74,10 @@ cp config.example.json config.json
 
 | 配置项 | 说明 |
 | --- | --- |
+| `register_mode` | `protocol`（默认，HTTP 协议注册）/ `browser`（旧 UI 注册页） |
 | `cpa_auto_add` | 是否注册后 SSO→CPA auth（关则只保存 SSO） |
-| `register_workers` | 并发浏览器数，默认 1，最大 8 |
+| `register_workers` | 并发度上限（协议流水线会映射到 P/C/O 等）；browser 模式为浏览器数，默认 1，最大 8 |
 | `log_level` | `info`（默认，隐藏 `[Debug]`）/ `debug`（全量日志） |
-
-### 并发 / 连通性
-
-**并发 `register_workers`**
-- 每个 worker 独立 Chrome 用户目录，降低资料目录冲突
-- 实际并发不超过注册数量；worker 启动错开约 2 秒
-- 浏览器连续启动失败时日志会提示降低并发
-
-**连通性检查**
-- GUI「连通性检查」或开始注册前自动跑
-- 检查项：代理 TCP/出站、邮箱 API、CPA 本地目录/远程 Management API
-- 失败默认只警告，不强制拦截开跑
-
-**NSFW**
-- SSO 保存后立即进入单后台队列，不阻塞 CPA 入库和后续账号注册
-- 先走限时 HTTP 快速路径；被 Cloudflare 拦截时复用一个后台浏览器，首个账号过盾后后续账号不重复打开页面
-- 正常批次会在退出前等待本批账号得到明确成功或失败结果；失败项保留在 `nsfw_pending.txt`
-- 追求最快注册速度且不需要敏感内容时，可关闭「注册后开启 NSFW」
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
@@ -108,6 +100,38 @@ cp config.example.json config.json
 | `cloudflare_path_*` | domains / accounts / token / messages 路径 |
 | `cloudflare_random_subdomain` | 是否创建 `user@随机子域.主域`（需 Worker `RANDOM_SUBDOMAIN_DOMAINS` 包含该主域） |
 | `defaultDomains` | Cloudflare / CloudMail 默认收信域名，多个用逗号分隔 |
+
+### 注册模式 / 并发 / NSFW
+
+**`register_mode`**
+
+- `protocol`（默认）：HTTP 协议注册；不打开注册页；Turnstile 仅屏外 mint
+- `browser`：旧 UI 注册页（易打上 `bot_flag_source`，probe 可能 402）
+- 环境变量覆盖：`GROK_REGISTER_MODE=protocol|browser`
+
+**协议批量流水线（S/P/C/O）**
+
+- `count≥2` 且 `register_mode=protocol` 时默认启用；`count=1` 走单号并行（Turnstile ∥ 建邮等码）
+- `GROK_PROTOCOL_PIPELINE=0` 强制关闭流水线；`=1` 时单号也可进流水线
+- signup config 进程内缓存，TTL 默认 1200s（`GROK_SIGNUP_CFG_TTL`）
+
+**并发 `register_workers`**
+
+- 协议模式：映射到流水线 P/C/O 等 worker 上限，Turnstile mint 默认 phys=1
+- browser 模式：每个 worker 独立 Chrome 用户目录；实际并发不超过注册数量
+
+**连通性检查**
+
+- GUI「连通性检查」或开始注册前自动跑
+- 检查项：代理 TCP/出站、邮箱 API、CPA 本地目录/远程 Management API
+- 失败默认只警告，不强制拦截开跑
+
+**NSFW**
+
+- SSO 保存后进入单后台队列，不阻塞 CPA 与后续注册
+- **批内默认纯 HTTP**（`set_tos` → `set_birth` → `update_nsfw`），不冷启浏览器，避免与 Turnstile 抢代理
+- 失败保留 `nsfw_pending.txt`；离线补开：`python cmd/retry_pending_nsfw.py`（可开浏览器）
+- 追求最快注册且不需要敏感内容时，可关 `enable_nsfw`
 
 ### Cloudflare 邮箱（默认匿名）
 
@@ -200,10 +224,11 @@ GUI「YYDS 收信域名」可填；留空则自动选择。
 
 SSO 不是 CPA 凭据。程序会：
 
-1. 用 SSO 走授权码流程（`referrer=grok-build`）向 `auth.x.ai` 换 `access_token` / `refresh_token`
+1. 用 SSO 走 **Device Authorization Flow** 向 `auth.x.ai` 换 `access_token` / `refresh_token`（**不**注入 `referrer` / `plan`，健康号 JWT 无这些 claim）
 2. 组装 `type=xai` 扁平 auth（`cli-chat-proxy.grok.com`）
 3. 本地：`cpa_auth_dir` → `xai-<email>.json`（CPA 热加载）
 4. 远程：`POST {cpa_remote_url}/v0/management/auth-files?name=...`（需管理密钥）
+5. 可选 probe：`cli-chat-proxy.grok.com/v1/responses` 测活（HTTP 200 为健康）
 
 ### 本地目录
 
@@ -277,16 +302,17 @@ python sso_to_auth_json.py --sso-cookie 'eyJ...' \
 
 配置了远程 CPA 时，批量转换以远程 Management API 返回的邮箱为唯一判重来源：本地 TXT 有、远程 CPA 没有的账号才会转换。没有配置远程 CPA 时，才回退到本地有效 auth JSON 判重。TXT 内重复邮箱也会先去重。
 
-### 为什么必须用授权码流程
+### 为什么用 Device Flow（健康号）
 
-这是本项目区别于普通 SSO→token 脚本的关键，踩过坑后固化下来：
+当前默认与测活策略（相对旧版授权码 + `referrer=grok-build`）：
 
-- **SSO 不能直接喂给 CPA。** CPA 走 OAuth，需要 `access_token` / `refresh_token`，SSO cookie 只是换 token 的入场券。
-- **必须带 `referrer=grok-build`。** xAI 后端要求 access_token 携带 `referrer=grok-build` claim，否则 grok build 通道（`cli-chat-proxy.grok.com`）拒绝，调用 chat 时报 `permission-denied / Access to the chat endpoint is denied`。早期用 device flow 换的 token **不带**这个 claim，会全部失效。
-- **解法：授权码流程（Authorization Code + PKCE）。** 在 `/oauth2/authorize` 和 consent 提交两处注入 `referrer=grok-build`，换出的 token 才带此 claim。程序换完会自动校验，日志显示 `access_token 已带 referrer=grok-build`。
-- **base_url 必须是 `cli-chat-proxy.grok.com/v1`。** 写入的 auth 记录 `base_url` 指向 grok build 免费通道；若为空，CPA 会回退到计费通道 `api.x.ai/v1`，同样触发 `permission-denied`。
+- **SSO 不能直接喂给 CPA。** 需要 `access_token` / `refresh_token`；SSO 只是换 token 的入场券。
+- **健康号 JWT 无 `referrer`、无 `bot_flag_source`。** UI 注册页路径容易打上 `bot_flag_source=1`，probe 常 402；协议注册 + Device Flow 出号更稳。
+- **不再强制 `referrer=grok-build`。** 旧说明要求授权码注入该 claim；现网健康样式为 `referrer=None`，日志会打印 `access_token 无 referrer（健康样式）`。
+- **base_url 仍用 `cli-chat-proxy.grok.com/v1`。** 指向 grok build 免费通道；勿写成空或误指 `api.x.ai/v1`。
+- **协议注册避免 bot flag。** `register_mode=protocol` 不走注册页浏览器，降低被标 bot 的概率。
 
-如果 CPA 里已有旧的失效号（`base_url=api.x.ai/v1` 或 `referrer=None`），用本节的独立转换脚本以相同邮箱重新生成一遍覆盖即可（文件名按 `xai-<email>.json` 命名，会原地覆盖）。
+若 CPA 里仍是旧失效号（错误 `base_url`、异常 claim），用独立转换脚本同邮箱重转覆盖 `xai-<email>.json` 即可。
 
 ## 运行
 
@@ -313,21 +339,23 @@ python grok_register_ttk.py
 | --- | --- |
 | `accounts_*.txt` | 邮箱、密码、SSO |
 | `mail_credentials.txt` | 临时邮箱凭证 |
+| `nsfw_pending.txt` | NSFW 未成功的邮箱----SSO（可离线补开） |
+| `sso_pending.txt` | CPA 入库失败待重转的 SSO |
+| `log/app_*.log` | 每次运行的应用日志 |
 
 均含敏感信息，已在 `.gitignore` 中忽略。`config.json` 也不提交，请用 `config.example.json` 复制。
 
 ## 稳定性
 
-- 每账号结束后重启浏览器
-- 每成功 5 个账号做一次内存清理
-- 邮箱提交后确认页面前进，避免空等验证码
-- 未收到验证码时换邮箱重试
-- 最终页卡住时重试当前账号
+- 协议模式：config 缓存、Turnstile 失败重试、curl_cffi TLS impersonate 降级
+- browser 模式：每账号后可重启浏览器；每成功 5 个做内存清理
+- 未收到验证码时换邮箱重试；流水线 Q/token 有 TTL，过期丢弃重取
+- Device Flow 限流（HTTP 429 `slow_down`）时 SSO 仍写入 accounts / `sso_pending.txt`，可稍后补转
 
 ## 常见问题
 
 **CPA 没出现新账号**  
-检查 `cpa_auto_add`、`cpa_auth_dir` 或 `cpa_remote_url` + `cpa_management_key`；看 `[CPA]` 日志是否换 token / 上传成功；本机/服务器能否访问 `auth.x.ai`。
+检查 `cpa_auto_add`、`cpa_auth_dir` 或 `cpa_remote_url` + `cpa_management_key`；看 `[CPA]` 日志是否 Device Flow 换 token / 上传成功；本机/服务器能否访问 `auth.x.ai`。
 
 **远程上传失败**  
 确认 CPA 管理 API 已启用、密钥明文正确；远程访问需 `allow-remote: true`。可用：
@@ -345,45 +373,53 @@ curl -H "Authorization: Bearer <管理密钥>" \
 
 **开启 NSFW 时返回 403**
 
-设置出生日期可能被 `grok.com` 的 Cloudflare 防护拦截。程序会先走 HTTP 快速路径，再复用一个后台浏览器过盾重试；失败不会影响账号保存和 CPA 入库，并会保留到 `nsfw_pending.txt`。不需要敏感内容时可关闭“注册后开启 NSFW”。
+`set_birth_date` 可能被 `grok.com` Cloudflare 拦截。批内只走 HTTP，失败进 `nsfw_pending.txt`，**不影响**账号保存与 CPA。离线补开：`python cmd/retry_pending_nsfw.py`。不需要敏感内容可关 `enable_nsfw`。
 
-**CLI 为什么还开浏览器**  
-CLI 只是不启动 Tk；注册页、Turnstile、SSO 仍依赖真实浏览器。
+**协议模式还会开浏览器吗**  
+会短暂开 **屏外 headed Chrome** 做 Turnstile mint（真 headless 易被 CF 拦）。注册页本身不打开。批内 NSFW 默认不再开浏览器。
 
 **NSFW 失败**  
-常见为 Cloudflare 拦截。账号仍会保存并入库 CPA，失败 SSO 会保留到 `nsfw_pending.txt`。
+常见为 Cloudflare 拦 `set_birth_date`。账号仍会保存并入库 CPA，失败保留到 `nsfw_pending.txt`。
 
 **国内服务器调模型超时**  
 入库成功只说明凭证到了 CPA；调用上游 `cli-chat-proxy.grok.com` 还需服务器出网可达（或配置 CPA `proxy-url`）。
 
 **CPA 返回 `503 auth_unavailable: no auth available`**  
-不是网络超时，而是 CPA 当前没有可用的 xAI auth。检查：auth 是否写入并被热加载、token 是否带 `referrer=grok-build`、账号是否 403 权限拒绝或 429 免费额度耗尽。free 号走 `cli-chat-proxy` 的 build 通道，额度与权限由上游控制，可能抖动。
+不是网络超时，而是 CPA 当前没有可用的 xAI auth。检查：auth 是否写入并被热加载、probe 是否 200、账号是否 403/429。free 号走 `cli-chat-proxy` build 通道，额度由上游控制。
 
-**chat 报 `permission-denied` / Access to the chat endpoint is denied**  
-token 缺 `referrer=grok-build`，或 `base_url` 误指向 `api.x.ai`。用本仓库授权码流程重转覆盖对应 `xai-<email>.json`。
+**chat 报 `permission-denied` 或 probe 402**  
+常见原因：UI 路径带 `bot_flag_source`、错误 `base_url`（应指向 `cli-chat-proxy.grok.com`）、或旧 claim 组合。优先用 **协议注册 + Device Flow** 重注册/重转覆盖 `xai-<email>.json`。
+
+**Device Flow 报 `slow_down` / 429**  
+短时间 device code 请求过多。SSO 已在 accounts / pending，稍后 `python sso_to_auth_json.py` 补转即可；适当降低并发或错开 O 阶段。
 
 ## 目录结构
 
 ```text
 .
 ├── grok_register_ttk.py      # 主程序（GUI / CLI + CPA 入库）
+├── protocol_signup.py        # 协议 HTTP 注册 / config 缓存 / mint∥建邮
+├── protocol_pipeline.py      # 批量 S/P/C/O 流水线
+├── scripts/turnstile_mint.py # Turnstile 屏外 mint
 ├── browser_session.py        # 浏览器启停 / cf_clearance
-├── register_flow.py          # 注册页填表 / 验证码 / SSO
+├── register_flow.py          # browser 模式注册页填表 / 验证码 / SSO
 ├── connectivity.py           # 启动前连通性检查
+├── nsfw_retry.py             # NSFW pending 队列
+├── cmd/retry_pending_nsfw.py # 离线补开 NSFW
 ├── email_providers/
-│   ├── common.py             # 验证码提取等共用工具
-│   ├── duckmail.py           # DuckMail / Mail.tm
-│   ├── cloudflare.py         # Cloudflare 临时邮箱
-│   ├── yyds.py               # YYDS
-│   ├── mailnest.py           # MailNest Outlook
-│   └── cloudmail.py          # CloudMail
-├── sso_to_auth_json.py       # SSO → CPA 转换（可独立运行）
-├── cf_mail_debug.py          # Cloudflare 邮箱调试
+│   ├── common.py
+│   ├── duckmail.py
+│   ├── cloudflare.py
+│   ├── yyds.py
+│   ├── mailnest.py
+│   └── cloudmail.py
+├── sso_to_auth_json.py       # SSO → CPA（Device Flow，可独立运行）
+├── cf_mail_debug.py
 ├── config.example.json
 ├── requirements.txt
-├── start-gui.cmd             # Windows 启动 GUI
-├── start-cli.cmd             # Windows 启动 CLI
-├── DEPLOYMENT.md             # 本机 / Windows 部署
+├── start-gui.cmd
+├── start-cli.cmd
+├── DEPLOYMENT.md
 ├── tests/
 └── assets/banner.png
 ```

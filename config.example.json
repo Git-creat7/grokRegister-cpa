@@ -15,6 +15,7 @@
   "cloudflare_random_subdomain": false,
   "proxy": "",
   "enable_nsfw": true,
+  "register_mode": "protocol",
   "close_browser_on_stop": false,
   "log_level": "info",
   "register_count": 1,

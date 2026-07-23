@@ -337,16 +337,28 @@ class RuntimeRegressionTests(unittest.TestCase):
         app.config["register_workers"] = 2
         app.config["enable_nsfw"] = True
         previous_handler = signal.getsignal(signal.SIGINT)
+
+        def fake_pipeline(count, **kwargs):
+            on_account = kwargs.get("on_account")
+            for i in range(int(count or 0)):
+                if on_account:
+                    on_account(
+                        f"a{i}@example.com",
+                        "secret",
+                        "sso-token",
+                        {"given_name": "A", "family_name": "B", "password": "secret"},
+                    )
+            stats = MagicMock()
+            stats.sso_ok = int(count or 0)
+            stats.done = int(count or 0)
+            stats.fail = 0
+            stats.mint_ok = int(count or 0)
+            stats.q_ok = int(count or 0)
+            return stats
+
         try:
             with patch.object(app, "create_nsfw_retry_worker", return_value=worker) as create_worker, patch.object(
-                app,
-                "register_account_once",
-                return_value=(
-                    "a@example.com",
-                    "secret",
-                    "sso-token",
-                    {"given_name": "A", "family_name": "B", "password": "secret"},
-                ),
+                app, "run_protocol_pipeline_batch", side_effect=fake_pipeline
             ), patch.object(app, "add_sso_to_cpa", return_value=True), patch.object(
                 app, "maybe_stop_browser"
             ), patch.object(app, "stop_browser"), patch.object(

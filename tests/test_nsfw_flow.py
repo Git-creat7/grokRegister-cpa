@@ -136,16 +136,37 @@ class NsfwFlowTests(unittest.TestCase):
         self.assertFalse(browser_enable.call_args.kwargs["navigate"])
         start_browser.assert_not_called()
 
-    def test_worker_uses_tos_only_when_browser_is_warm(self):
-        page = SimpleNamespace(url="https://grok.com/")
-        with patch.object(app, "_active_page", return_value=page), patch.object(
+    def test_worker_http_only_by_default(self):
+        """注册批内 worker 对齐初版：纯 HTTP，失败不冷启浏览器。"""
+        with patch.object(
             app,
             "enable_nsfw_for_token",
-            return_value=(True, "TOS 已确认"),
+            return_value=(False, "set_birth_date 被 Cloudflare 拦截，HTTP 403"),
         ) as http_enable, patch.object(
             app,
             "enable_nsfw_with_reused_browser",
-            return_value=(True, "ok"),
+        ) as browser_enable:
+            worker = app.create_nsfw_retry_worker(log_callback=lambda _: None)
+            ok, message = worker.retry_callback(
+                "user@example.com",
+                "sso-token",
+                lambda: False,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("Cloudflare", message)
+        self.assertFalse(http_enable.call_args.kwargs["tos_only"])
+        self.assertFalse(http_enable.call_args.kwargs["allow_browser_fallback"])
+        browser_enable.assert_not_called()
+
+    def test_worker_http_success_returns_ok(self):
+        with patch.object(
+            app,
+            "enable_nsfw_for_token",
+            return_value=(True, "成功开启 NSFW（HTTP 快速路径）"),
+        ) as http_enable, patch.object(
+            app,
+            "enable_nsfw_with_reused_browser",
         ) as browser_enable:
             worker = app.create_nsfw_retry_worker(log_callback=lambda _: None)
             ok, message = worker.retry_callback(
@@ -155,8 +176,31 @@ class NsfwFlowTests(unittest.TestCase):
             )
 
         self.assertTrue(ok)
+        self.assertIn("HTTP", message)
+        browser_enable.assert_not_called()
+        http_enable.assert_called_once()
+
+    def test_worker_allow_browser_falls_back(self):
+        with patch.object(
+            app,
+            "enable_nsfw_for_token",
+            return_value=(False, "HTTP 403"),
+        ), patch.object(
+            app,
+            "enable_nsfw_with_reused_browser",
+            return_value=(True, "ok"),
+        ) as browser_enable:
+            worker = app.create_nsfw_retry_worker(
+                log_callback=lambda _: None, allow_browser=True
+            )
+            ok, message = worker.retry_callback(
+                "user@example.com",
+                "sso-token",
+                lambda: False,
+            )
+
+        self.assertTrue(ok)
         self.assertEqual(message, "ok")
-        self.assertTrue(http_enable.call_args.kwargs["tos_only"])
         browser_enable.assert_called_once()
 
 

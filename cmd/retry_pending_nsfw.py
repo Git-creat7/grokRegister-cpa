@@ -16,7 +16,10 @@ from nsfw_retry import load_pending_entries  # noqa: E402
 def main() -> int:
     app.load_config()
     app._wire_runtime_modules(gui_mode=False)
-    worker = app.create_nsfw_retry_worker(log_callback=print, idle_timeout=1.0)
+    # 离线补开允许浏览器；注册批内默认 allow_browser=False 避免抢代理
+    worker = app.create_nsfw_retry_worker(
+        log_callback=print, idle_timeout=1.0, allow_browser=True
+    )
     total = worker.start_existing()
     print(f"[NSFW] pending={total} file={app.NSFW_PENDING_FILE}", flush=True)
     if not total:

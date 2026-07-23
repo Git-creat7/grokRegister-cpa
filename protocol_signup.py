@@ -18,12 +18,20 @@ import secrets
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urljoin, urlparse
 
 from curl_cffi import requests
+
+# 进程内 signup config 缓存（site_key / action_id / state_tree）
+_CFG_LOCK = threading.Lock()
+_CFG_CACHE: Optional[Dict[str, str]] = None
+_CFG_CACHE_AT = 0.0
+_CFG_TTL_SEC = float(os.environ.get("GROK_SIGNUP_CFG_TTL", "1200") or "1200")
 
 SITE_URL = "https://accounts.x.ai"
 CONNECT_CREATE = f"{SITE_URL}/auth_mgmt.AuthManagement/CreateEmailValidationCode"
@@ -297,6 +305,51 @@ def _find_chrome() -> str:
         if p and os.path.isfile(p):
             return p
     return ""
+
+
+def get_cached_config(
+    proxy: str = "",
+    should_stop: Optional[Callable[[], bool]] = None,
+    log: Optional[Callable] = None,
+    force: bool = False,
+    client: Optional["ProtocolClient"] = None,
+) -> Dict[str, str]:
+    """进程内复用 signup config，默认 TTL 20 分钟。"""
+    global _CFG_CACHE, _CFG_CACHE_AT
+    now = time.time()
+    with _CFG_LOCK:
+        if (
+            not force
+            and _CFG_CACHE
+            and _CFG_CACHE.get("site_key")
+            and _CFG_CACHE.get("action_id")
+            and _CFG_CACHE.get("state_tree")
+            and (now - _CFG_CACHE_AT) < max(60.0, _CFG_TTL_SEC)
+        ):
+            return dict(_CFG_CACHE)
+    cli = client or ProtocolClient(proxy=proxy)
+    _log(log, "[*] 协议注册：获取 signup config ...")
+    cfg = cli.fetch_config(should_stop=should_stop)
+    with _CFG_LOCK:
+        _CFG_CACHE = {
+            "site_key": cfg["site_key"],
+            "action_id": cfg["action_id"],
+            "state_tree": cfg["state_tree"],
+        }
+        _CFG_CACHE_AT = time.time()
+        out = dict(_CFG_CACHE)
+    _log(
+        log,
+        f"[*] SITE_KEY={out['site_key'][:16]}... ACTION={out['action_id'][:12]}... (cached)",
+    )
+    return out
+
+
+def clear_config_cache() -> None:
+    global _CFG_CACHE, _CFG_CACHE_AT
+    with _CFG_LOCK:
+        _CFG_CACHE = None
+        _CFG_CACHE_AT = 0.0
 
 
 def mint_turnstile(
@@ -673,62 +726,110 @@ def register_one(
     cfg: Optional[Dict[str, str]] = None,
     turnstile_token: str = "",
 ) -> Dict[str, Any]:
-    """完成一次协议注册，返回 email/password/sso/profile。"""
+    """完成一次协议注册，返回 email/password/sso/profile。
+
+    优化：进程内 config 缓存；Turnstile mint 与 建邮+发码+等码 并行。
+    """
     if _cancelled(should_stop):
         raise RuntimeError("用户已停止")
     cli = client or ProtocolClient(proxy=proxy)
     if not cfg:
-        _log(log, "[*] 协议注册：获取 signup config ...")
-        cfg = cli.fetch_config(should_stop=should_stop)
-        _log(
-            log,
-            f"[*] SITE_KEY={cfg['site_key'][:16]}... ACTION={cfg['action_id'][:12]}...",
-        )
-    token = turnstile_token
-    if not token:
-        token = mint_turnstile(
-            cfg["site_key"],
-            page_url=SIGNUP_PAGE_URL,
+        cfg = get_cached_config(
             proxy=proxy,
-            log=log,
             should_stop=should_stop,
+            log=log,
+            client=cli,
         )
-    if _cancelled(should_stop):
-        raise RuntimeError("用户已停止")
-    email, dev_token = get_email_and_token()
-    if not email:
-        raise RuntimeError("获取邮箱失败")
-    _log(log, f"[*] 已创建邮箱: {email}")
     password = generate_password()
     given = random.choice(_GIVEN)
     family = random.choice(_FAMILY)
 
-    cli.clear_auth_cookies()
-    _log(log, "[*] CreateEmailCode ...")
-    cli.create_email_code(email)
+    token_holder: Dict[str, Any] = {"token": (turnstile_token or "").strip(), "err": None}
+    mail_holder: Dict[str, Any] = {
+        "email": "",
+        "dev_token": "",
+        "code": "",
+        "err": None,
+    }
+
+    def _mint_branch() -> None:
+        if token_holder["token"]:
+            return
+        try:
+            token_holder["token"] = mint_turnstile(
+                cfg["site_key"],
+                page_url=SIGNUP_PAGE_URL,
+                proxy=proxy,
+                log=log,
+                should_stop=should_stop,
+            )
+        except Exception as exc:
+            token_holder["err"] = exc
+
+    def _mail_branch() -> None:
+        # 并行用独立 session，避免与 mint 子进程无关的 cookie 争用
+        mail_cli = ProtocolClient(proxy=proxy, user_agent=cli.ua)
+        try:
+            email, dev_token = get_email_and_token()
+            if not email:
+                raise RuntimeError("获取邮箱失败")
+            mail_holder["email"] = email
+            mail_holder["dev_token"] = dev_token
+            _log(log, f"[*] 已创建邮箱: {email}")
+            mail_cli.clear_auth_cookies()
+            _log(log, "[*] CreateEmailCode ...")
+            mail_cli.create_email_code(email)
+            if _cancelled(should_stop):
+                raise RuntimeError("用户已停止")
+            _log(log, "[*] 等待验证码 ...")
+            code = get_oai_code(
+                dev_token,
+                email,
+                log_callback=log,
+                cancel_callback=should_stop,
+            )
+            if not code:
+                raise RuntimeError("获取验证码失败")
+            mail_holder["code"] = str(code).replace("-", "").strip()
+            # 复用 mail_cli 的 cookie 给后续 Verify/Signup
+            mail_holder["client"] = mail_cli
+        except Exception as exc:
+            mail_holder["err"] = exc
+
+    _log(log, "[*] Turnstile ∥ 建邮发码（并行）...")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_mint = pool.submit(_mint_branch)
+        fut_mail = pool.submit(_mail_branch)
+        fut_mint.result()
+        fut_mail.result()
+
     if _cancelled(should_stop):
         raise RuntimeError("用户已停止")
-    _log(log, "[*] 等待验证码 ...")
-    code = get_oai_code(
-        dev_token,
-        email,
-        log_callback=log,
-        cancel_callback=should_stop,
-    )
-    if not code:
-        raise RuntimeError("获取验证码失败")
-    clean_code = str(code).replace("-", "").strip()
+    if token_holder["err"] is not None:
+        raise RuntimeError(f"turnstile: {token_holder['err']}") from token_holder["err"]
+    if mail_holder["err"] is not None:
+        raise RuntimeError(f"email/code: {mail_holder['err']}") from mail_holder["err"]
+
+    token = token_holder["token"]
+    email = mail_holder["email"]
+    clean_code = mail_holder["code"]
+    if not token or len(str(token)) <= 10:
+        raise RuntimeError("turnstile token 为空")
+    if not email or not clean_code:
+        raise RuntimeError("邮箱或验证码为空")
+
+    # 优先使用 mail 分支 session（已走过 CreateEmailCode）
+    work_cli = mail_holder.get("client") or cli
     _log(log, f"[*] 验证码: {clean_code}")
     _log(log, "[*] VerifyEmailCode ...")
-    cli.verify_email_code(email, clean_code)
+    work_cli.verify_email_code(email, clean_code)
     body = build_signup_body(email, password, clean_code, token)
-    # rebuild body with our chosen names for consistent profile return
     body_obj = json.loads(body.decode("utf-8"))
     body_obj[0]["createUserAndSessionRequest"]["givenName"] = given
     body_obj[0]["createUserAndSessionRequest"]["familyName"] = family
     body = json.dumps(body_obj, separators=(",", ":")).encode("utf-8")
     _log(log, "[*] SignupServerAction ...")
-    text, sso = cli.signup_server_action(body, cfg["action_id"], cfg["state_tree"])
+    text, sso = work_cli.signup_server_action(body, cfg["action_id"], cfg["state_tree"])
     if not sso:
         sso = extract_sso_from_text(text)
     if not sso:

@@ -74,6 +74,7 @@ from register_flow import (
     wait_for_sso_cookie,
 )
 import protocol_signup as _protocol
+import protocol_pipeline as _pipeline
 
 
 
@@ -493,6 +494,55 @@ def use_protocol_register() -> bool:
     if env:
         mode = env
     return mode in ("protocol", "http", "api", "1", "true", "yes")
+
+
+def use_protocol_pipeline(count: int, workers: int = 1) -> bool:
+    """批量协议注册走 S/P/C/O 流水线（target>=2）。单号走 register_one（内含并行）。"""
+    if not use_protocol_register():
+        return False
+    env = str(os.environ.get("GROK_PROTOCOL_PIPELINE", "") or "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return int(count or 0) >= 1
+    return int(count or 0) >= 2
+
+
+def run_protocol_pipeline_batch(
+    count,
+    *,
+    log_callback=None,
+    should_stop=None,
+    on_account=None,
+    register_workers=1,
+):
+    """跑协议 S/P/C/O 流水线。on_account(email, password, sso, profile) 在 O 阶段调用。"""
+    proxy = _resolve_cpa_proxy()
+    if log_callback:
+        log_callback("[*] 注册模式: protocol pipeline（S/P/C/O）")
+
+    def _on_sso(email, password, sso, profile):
+        if on_account:
+            on_account(email, password, sso, profile or {})
+        else:
+            add_sso_to_cpa(
+                sso,
+                email=email,
+                log_callback=log_callback,
+                should_stop=should_stop,
+            )
+
+    pipe = _pipeline.ProtocolPipeline(
+        target=int(count or 1),
+        proxy=proxy,
+        get_email_and_token=get_email_and_token,
+        get_oai_code=get_oai_code,
+        on_sso=_on_sso,
+        log=log_callback,
+        should_stop=should_stop,
+        register_workers=register_workers,
+    )
+    return pipe.run()
 
 
 def register_account_once(log_callback=None, cancel_callback=None):
@@ -1320,7 +1370,10 @@ def enable_nsfw_via_browser(
     cancel_callback=None,
     navigate=True,
 ):
-    """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。"""
+    """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。
+
+    协议注册模式通常无暖页；冷启易卡 CF，默认 worker 不再走此路径。
+    """
     page_obj = _active_page()
     if page_obj is None:
         return False, "浏览器页面未就绪"
@@ -1373,8 +1426,8 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
                 page_obj.wait.doc_loaded()
             except Exception:
                 pass
-            # 等 CF 挑战结束，否则 fetch 也会拿到 Just a moment
-            for _ in range(25):
+            # 等 CF 挑战结束（短等，不强制 cf_clearance cookie）
+            for _ in range(15):
                 if _cancelled():
                     return False, "用户已停止"
                 try:
@@ -1394,7 +1447,7 @@ document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
             else:
                 if log_callback:
                     log_callback("[!] grok.com 仍停在 Cloudflare 挑战页，浏览器内 NSFW 可能失败")
-            time.sleep(1.0)
+            time.sleep(0.5)
 
         if _cancelled():
             return False, "用户已停止"
@@ -1604,7 +1657,10 @@ def enable_nsfw_with_reused_browser(
     attempts=2,
     retry_delay=8.0,
 ):
-    """在后台复用一个浏览器补开；CF 拦截时保留会话后重试。"""
+    """在后台复用一个浏览器补开；CF 拦截时保留会话后重试。
+
+    仅供 cmd/retry_pending_nsfw 等离线补开；注册批内默认不走浏览器。
+    """
 
     def stopped():
         return bool(should_stop and should_stop())
@@ -1653,8 +1709,12 @@ def create_nsfw_retry_worker(
     log_callback=print,
     idle_timeout=90.0,
     cancel_callback=None,
+    allow_browser=False,
 ):
-    """创建单浏览器 NSFW 补开 worker；供 GUI 和自用脚本复用。"""
+    """创建 NSFW 补开 worker（对齐初版：纯 HTTP，不挡注册、不抢 Turnstile 代理）。
+
+    allow_browser=True 时才冷启浏览器（离线 pending 补开可用）。
+    """
 
     def nsfw_log(message):
         if log_callback:
@@ -1667,30 +1727,19 @@ def create_nsfw_retry_worker(
                 or (cancel_callback and cancel_callback())
             )
 
-        page_obj = _active_page()
-        current_url = str(getattr(page_obj, "url", "") or "").lower()
-        browser_ready = current_url.startswith("https://grok.com")
+        # 初版路径：sso cookie + HTTP set_tos → set_birth → update_nsfw
         ok, message = enable_nsfw_for_token(
             sso,
             log_callback=nsfw_log,
             cancel_callback=should_stop,
             allow_browser_fallback=False,
-            http_budget=8,
-            tos_only=browser_ready,
+            http_budget=12,
+            tos_only=False,
         )
-        if should_stop():
+        if should_stop() or ok or not allow_browser:
             return ok, message
-        if ok and not browser_ready:
-            return True, message
-        if browser_ready:
-            if not ok:
-                nsfw_log(f"[NSFW] TOS 快速路径未成功，仍复用浏览器: {message}")
-            return enable_nsfw_with_reused_browser(
-                sso,
-                log_callback=nsfw_log,
-                should_stop=should_stop,
-            )
-        nsfw_log(f"[NSFW] HTTP 未成功，转复用浏览器: {message}")
+
+        nsfw_log(f"[NSFW] HTTP 未成功，转浏览器: {message}")
         return enable_nsfw_with_reused_browser(
             sso,
             log_callback=nsfw_log,
@@ -1700,7 +1749,7 @@ def create_nsfw_retry_worker(
     return NsfwRetryWorker(
         NSFW_PENDING_FILE,
         retry,
-        cleanup_callback=stop_browser,
+        cleanup_callback=stop_browser if allow_browser else None,
         log=nsfw_log,
         idle_timeout=idle_timeout,
     )
@@ -2781,7 +2830,9 @@ class GrokRegisterGUI:
         # 并发数不超过任务数，避免空 worker 白开浏览器
         workers = max(1, min(int(workers or 1), 8, int(count or 1)))
         try:
-            if workers <= 1:
+            if use_protocol_pipeline(count, workers):
+                self.run_protocol_pipeline_registration(count, workers)
+            elif workers <= 1:
                 self.run_registration(count, worker_id=0, workers=1)
             else:
                 base, rem = divmod(count, workers)
@@ -2819,6 +2870,70 @@ class GrokRegisterGUI:
                 f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
                 + (f" | {format_fail_stats(self.fail_stats)}" if self.fail_count else "")
             )
+
+    def run_protocol_pipeline_registration(self, count, workers=1):
+        """GUI 批量协议注册：S/P/C/O 流水线，O 阶段写账号 + NSFW + CPA。"""
+        self.log("[*] 协议注册模式：S/P/C/O 流水线（不启动注册页浏览器）")
+
+        def on_account(email, password, sso, profile):
+            if not profile:
+                profile = {"password": password}
+            elif password and not profile.get("password"):
+                profile["password"] = password
+            try:
+                line = f"{email}----{profile.get('password','') or password}----{sso}\n"
+                alock = getattr(self, "_accounts_lock", None)
+                if alock:
+                    with alock:
+                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
+                            f.write(line)
+                else:
+                    with open(self.accounts_output_file, "a", encoding="utf-8") as f:
+                        f.write(line)
+            except Exception as file_exc:
+                self.log(f"[!] 保存账号文件失败: {file_exc}")
+                _append_sso_pending(email, sso, log_callback=self.log)
+                raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+            lock = getattr(self, "_stats_lock", None)
+            if lock:
+                with lock:
+                    self.results.append({"email": email, "sso": sso, "profile": profile})
+            else:
+                self.results.append({"email": email, "sso": sso, "profile": profile})
+            if config.get("enable_nsfw", True):
+                self._submit_nsfw(email, sso, log_callback=self.log)
+            cpa_ok = add_sso_to_cpa(
+                sso,
+                email=email,
+                log_callback=self.log,
+                should_stop=self.should_stop,
+            )
+            self._record_success()
+            self.update_stats()
+            if cpa_ok:
+                self.log(f"[+] 注册成功: {email}")
+            else:
+                self.log(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+
+        try:
+            stats = run_protocol_pipeline_batch(
+                count,
+                log_callback=self.log,
+                should_stop=self.should_stop,
+                on_account=on_account,
+                register_workers=workers,
+            )
+            if stats.fail and self.fail_count < stats.fail:
+                delta = stats.fail - self.fail_count
+                for _ in range(delta):
+                    self._record_failure(RuntimeError("pipeline stage fail"))
+                self.update_stats()
+        except RegistrationCancelled:
+            self.log("[!] 注册被用户停止")
+        except Exception as exc:
+            self.log(f"[!] 流水线异常: {exc}")
+            self._record_failure(exc)
+            self.update_stats()
 
     def run_registration(self, count, worker_id=0, workers=1):
         prefix = f"[W{worker_id + 1}] " if workers > 1 else ""
@@ -3079,6 +3194,70 @@ def run_registration_cli(count):
         fail_count += 1
         fail_stats[kind] = fail_stats.get(kind, 0) + 1
         return kind
+
+    if use_protocol_pipeline(count, workers):
+        # 协议批量：S/P/C/O 流水线（O 阶段写账号/NSFW/CPA）
+        stats_lock = threading.Lock()
+
+        def on_account(email, password, sso, profile):
+            nonlocal success_count
+            if not profile:
+                profile = {"password": password}
+            elif password and not profile.get("password"):
+                profile["password"] = password
+            try:
+                line = f"{email}----{profile.get('password','') or password}----{sso}\n"
+                with stats_lock:
+                    with open(accounts_output_file, "a", encoding="utf-8") as f:
+                        f.write(line)
+            except Exception as file_exc:
+                cli_log(f"[!] 保存账号文件失败: {file_exc}")
+                _append_sso_pending(email, sso, log_callback=cli_log)
+                raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+            _submit_cli_nsfw(email, sso)
+            cpa_ok = add_sso_to_cpa(
+                sso,
+                email=email,
+                log_callback=cli_log,
+                should_stop=controller.should_stop,
+            )
+            with stats_lock:
+                success_count += 1
+                sc = success_count
+            if cpa_ok:
+                cli_log(f"[+] 注册成功: {email}")
+            else:
+                cli_log(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+            cli_log(f"[*] 当前统计: 成功 {sc} | 失败 {fail_count}")
+
+        try:
+            pipe_stats = run_protocol_pipeline_batch(
+                count,
+                log_callback=cli_log,
+                should_stop=controller.should_stop,
+                on_account=on_account,
+                register_workers=workers,
+            )
+            if pipe_stats.fail:
+                fail_count = max(fail_count, int(pipe_stats.fail))
+                fail_stats[FAIL_OTHER] = fail_stats.get(FAIL_OTHER, 0) + int(
+                    pipe_stats.fail
+                )
+        except RegistrationCancelled:
+            cli_log("[!] 注册被停止")
+        except Exception as exc:
+            kind = _cli_record_failure(exc)
+            cli_log(f"[-] 流水线异常 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
+        _finish_cli_nsfw()
+        cli_log(
+            f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
+            + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
+        )
+        try:
+            signal.signal(signal.SIGINT, _prev_sigint)
+        except Exception:
+            pass
+        return
 
     if workers > 1:
         # CLI 并发：多线程，每线程独立浏览器（thread-local）
