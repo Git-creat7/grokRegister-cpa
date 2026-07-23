@@ -6,7 +6,7 @@ Grok 注册机 - TTK GUI 版本
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 import threading
 import datetime
 import time
@@ -35,6 +35,7 @@ from email_providers import cloudflare as cloudflare_provider
 from email_providers import cloudmail as cloudmail_provider
 from email_providers import duckmail as duckmail_provider
 from email_providers import mailnest as mailnest_provider
+from email_providers import outlook as outlook_provider
 from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
 from email_providers.common import generate_username as _generate_username
@@ -165,6 +166,7 @@ DEFAULT_CONFIG = {
     "cpa_management_key": "",
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
+    "outlook_accounts_file": "outlook_accounts.json",
     # YYDS：留空自动选已验证域名；填写则固定该域名
     "yyds_default_domain": "",
     # 协议 HTTP 注册（对齐 grok-register-new）：默认开启，避免浏览器 UI 打 bot 标
@@ -173,6 +175,8 @@ DEFAULT_CONFIG = {
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
+_outlook_batch_runtime = None
+_outlook_batch_runtime_lock = threading.RLock()
 
 
 class RegistrationCancelled(Exception):
@@ -500,6 +504,8 @@ def use_protocol_pipeline(count: int, workers: int = 1) -> bool:
     """批量协议注册走 S/P/C/O 流水线（target>=2）。单号走 register_one（内含并行）。"""
     if not use_protocol_register():
         return False
+    if str(config.get("email_provider", "") or "").strip().lower() == "outlook":
+        return False
     env = str(os.environ.get("GROK_PROTOCOL_PIPELINE", "") or "").strip().lower()
     if env in ("0", "false", "no", "off"):
         return False
@@ -549,44 +555,70 @@ def register_account_once(log_callback=None, cancel_callback=None):
     """注册一个账号，返回 (email, password, sso, profile)。
 
     默认走纯 HTTP 协议路径（无注册页浏览器）；register_mode=browser 时回退 UI 路径。
+    Outlook 的内部 lease_id 通过 profile/异常属性传给批次结算层，不会写入账号结果。
     """
     if use_protocol_register():
         proxy = _resolve_cpa_proxy()
         if log_callback:
             log_callback("[*] 注册模式: protocol（无注册页浏览器）")
-        result = _protocol.register_one(
-            get_email_and_token=get_email_and_token,
-            get_oai_code=get_oai_code,
-            proxy=proxy,
-            log=log_callback,
-            should_stop=cancel_callback,
-        )
+        mail_context = {"email": "", "lease_id": ""}
+
+        def _tracked_get_email_and_token():
+            email, token = get_email_and_token()
+            mail_context["email"] = email
+            mail_context["lease_id"] = token
+            return email, token
+
+        try:
+            result = _protocol.register_one(
+                get_email_and_token=_tracked_get_email_and_token,
+                get_oai_code=get_oai_code,
+                proxy=proxy,
+                log=log_callback,
+                should_stop=cancel_callback,
+            )
+        except Exception as exc:
+            if _is_outlook_provider() and mail_context["lease_id"]:
+                exc.outlook_lease_id = mail_context["lease_id"]
+            raise
+        profile = dict(result.get("profile") or {})
+        if _is_outlook_provider() and mail_context["lease_id"]:
+            profile["_outlook_lease_id"] = mail_context["lease_id"]
         return (
             result["email"],
             result.get("password", ""),
             result["sso"],
-            result.get("profile") or {},
+            profile,
         )
 
     if log_callback:
         log_callback("[*] 注册模式: browser（DrissionPage UI）")
-    open_signup_page(log_callback=log_callback, cancel_callback=cancel_callback)
-    email, dev_token = fill_email_and_submit(
-        log_callback=log_callback, cancel_callback=cancel_callback
-    )
-    code = fill_code_and_submit(
-        email,
-        dev_token,
-        log_callback=log_callback,
-        cancel_callback=cancel_callback,
-    )
-    del code
-    profile = fill_profile_and_submit(
-        log_callback=log_callback, cancel_callback=cancel_callback
-    )
-    sso = wait_for_sso_cookie(
-        log_callback=log_callback, cancel_callback=cancel_callback
-    )
+    email = ""
+    dev_token = ""
+    try:
+        open_signup_page(log_callback=log_callback, cancel_callback=cancel_callback)
+        email, dev_token = fill_email_and_submit(
+            log_callback=log_callback, cancel_callback=cancel_callback
+        )
+        code = fill_code_and_submit(
+            email,
+            dev_token,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+        del code
+        profile = fill_profile_and_submit(
+            log_callback=log_callback, cancel_callback=cancel_callback
+        )
+        sso = wait_for_sso_cookie(
+            log_callback=log_callback, cancel_callback=cancel_callback
+        )
+    except Exception as exc:
+        if _is_outlook_provider() and dev_token:
+            exc.outlook_lease_id = dev_token
+        raise
+    if _is_outlook_provider() and dev_token:
+        profile["_outlook_lease_id"] = dev_token
     return email, profile.get("password", ""), sso, profile
 
 
@@ -1031,8 +1063,69 @@ def get_email_provider():
     return config.get("email_provider", "cloudflare")
 
 
+def _is_outlook_provider():
+    return str(get_email_provider() or "").strip().lower() == "outlook"
+
+
+def _resolve_outlook_accounts_path():
+    raw_path = str(config.get("outlook_accounts_file", "") or "").strip()
+    if not raw_path:
+        raise outlook_provider.OutlookConfigError("未配置 Outlook 账号文件")
+    expanded = os.path.expanduser(raw_path)
+    return expanded if os.path.isabs(expanded) else os.path.join(APP_DIR, expanded)
+
+
+def _initialize_outlook_batch_runtime(count=None, log_callback=None):
+    global _outlook_batch_runtime
+    runtime = outlook_provider.OutlookBatchRuntime.from_file(
+        _resolve_outlook_accounts_path(),
+        proxy=str(config.get("proxy", "") or "").strip(),
+    )
+    requested = int(count or 0)
+    if requested > runtime.available_count:
+        available = runtime.available_count
+        runtime.close()
+        raise outlook_provider.OutlookConfigError(
+            f"注册数量 {requested} 超过可用 Outlook 账号数 {available}"
+        )
+    with _outlook_batch_runtime_lock:
+        previous = _outlook_batch_runtime
+        _outlook_batch_runtime = runtime
+    if previous is not None:
+        previous.close()
+    if log_callback:
+        log_callback(f"[*] Outlook 账号池已加载：{runtime.available_count} 个（Microsoft Graph）")
+    return runtime
+
+
+def _clear_outlook_batch_runtime():
+    global _outlook_batch_runtime
+    with _outlook_batch_runtime_lock:
+        runtime = _outlook_batch_runtime
+        _outlook_batch_runtime = None
+    if runtime is not None:
+        runtime.close()
+
+
+def _get_outlook_batch_runtime():
+    with _outlook_batch_runtime_lock:
+        return _outlook_batch_runtime
+
+
+def _settle_outlook_lease(lease_id, success):
+    runtime = _get_outlook_batch_runtime()
+    if runtime is None or not str(lease_id or "").strip():
+        return False
+    return runtime.succeed(lease_id) if success else runtime.fail(lease_id)
+
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
+    if str(provider or "").strip().lower() == "outlook":
+        runtime = _get_outlook_batch_runtime()
+        if runtime is None:
+            raise outlook_provider.OutlookLeaseError("Outlook 账号池尚未初始化")
+        return runtime.acquire()
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudmail":
@@ -1080,6 +1173,18 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    if str(provider or "").strip().lower() == "outlook":
+        runtime = _get_outlook_batch_runtime()
+        if runtime is None:
+            raise outlook_provider.OutlookLeaseError("Outlook 账号池尚未初始化")
+        return runtime.wait_code(
+            dev_token,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -1926,6 +2031,7 @@ class GrokRegisterGUI:
         self.root.minsize(960, 700)
         self.is_running = False
         self.sso_convert_running = False
+        self.outlook_test_running = False
         self.sso_convert_stop_requested = False
         self.batch_count = 0
         self.success_count = 0
@@ -2010,7 +2116,7 @@ class GrokRegisterGUI:
         self.email_provider_combo = tk_option_menu(
             config_frame,
             self.email_provider_var,
-            ["duckmail", "yyds", "cloudflare", "mailnest", "cloudmail"],
+            ["duckmail", "yyds", "cloudflare", "mailnest", "cloudmail", "outlook"],
             width=12,
         )
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
@@ -2217,12 +2323,68 @@ class GrokRegisterGUI:
             ),
         ]
 
+        # Outlook OAuth2 / Microsoft Graph
+        self.outlook_accounts_file_var = tk.StringVar(
+            value=str(config.get("outlook_accounts_file", "outlook_accounts.json") or "outlook_accounts.json")
+        )
+        self.outlook_count_var = tk.StringVar(value="有效账号：未加载")
+        self.outlook_browse_btn = tk_button(
+            self.provider_frame,
+            text="选择 TXT/JSON",
+            command=self.select_outlook_accounts_file,
+        )
+        self.outlook_import_btn = tk_button(
+            self.provider_frame,
+            text="粘贴账号",
+            command=self.open_outlook_accounts_import_dialog,
+        )
+        self.outlook_test_btn = tk_button(
+            self.provider_frame,
+            text="测试 Outlook 连接",
+            command=self.test_outlook_connection,
+        )
+        self._outlook_widgets = [
+            p_label(0, 0, "账号文件:"),
+            p_field(
+                tk_entry(self.provider_frame, textvariable=self.outlook_accounts_file_var, width=42),
+                0,
+                1,
+                columnspan=2,
+            ),
+            p_field(self.outlook_browse_btn, 0, 3, sticky=tk.W),
+            p_field(self.outlook_import_btn, 1, 0, sticky=tk.W),
+            p_field(self.outlook_test_btn, 1, 1, sticky=tk.W),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    textvariable=self.outlook_count_var,
+                    bg=UI_PANEL_BG,
+                ),
+                1,
+                2,
+                columnspan=2,
+                sticky=tk.W,
+            ),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    text="每行：email----password----client_id----refresh_token；password 会被丢弃",
+                    bg=UI_PANEL_BG,
+                ),
+                2,
+                0,
+                columnspan=4,
+                sticky=tk.W,
+            ),
+        ]
+
         self._provider_widget_groups = {
             "duckmail": self._duckmail_widgets,
             "cloudflare": self._cloudflare_widgets,
             "yyds": self._yyds_widgets,
             "mailnest": self._mailnest_widgets,
             "cloudmail": self._cloudmail_widgets,
+            "outlook": self._outlook_widgets,
         }
 
         add_label(3, 0, "并发数（可选）:")
@@ -2373,6 +2535,7 @@ class GrokRegisterGUI:
             "yyds": "YYDS 配置",
             "mailnest": "MailNest 配置",
             "cloudmail": "CloudMail 配置",
+            "outlook": "Outlook OAuth2（Graph）",
         }
         self.provider_frame.configure(text=titles.get(provider, "邮箱服务商配置"))
         for widgets in self._provider_widget_groups.values():
@@ -2381,6 +2544,140 @@ class GrokRegisterGUI:
         for widget in self._provider_widget_groups.get(provider, self._cloudflare_widgets):
             # grid_remove 后无参 grid() 会恢复原行列
             widget.grid()
+
+    def _set_outlook_accounts(self, accounts, path=None):
+        count = len(accounts)
+        if path:
+            self.outlook_accounts_file_var.set(str(path))
+        self.outlook_count_var.set(f"有效账号：{count}")
+        self.count_var.set(str(count))
+        return count
+
+    def select_outlook_accounts_file(self):
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择 Outlook 账号文件",
+            filetypes=[("文本账号", "*.txt"), ("JSON 账号", "*.json"), ("所有文件", "*")],
+        )
+        if not path:
+            return
+        try:
+            accounts = outlook_provider.load_accounts_file(path)
+        except outlook_provider.OutlookError as exc:
+            messagebox.showerror("Outlook 账号文件错误", str(exc), parent=self.root)
+            return
+        self._set_outlook_accounts(accounts, path)
+        self.log(f"[*] 已选择 Outlook 账号文件，有效账号 {len(accounts)} 个")
+
+    def _import_outlook_accounts_text(self, raw_text):
+        accounts = outlook_provider.parse_accounts_text(raw_text, source="GUI 粘贴")
+        selected = self.outlook_accounts_file_var.get().strip()
+        if selected:
+            expanded = os.path.expanduser(selected)
+            selected_path = expanded if os.path.isabs(expanded) else os.path.join(APP_DIR, expanded)
+            destination = selected_path if selected_path.lower().endswith(".json") else os.path.splitext(selected_path)[0] + ".json"
+        else:
+            destination = os.path.join(APP_DIR, "outlook_accounts.json")
+        outlook_provider.write_accounts_json(destination, accounts)
+        self._set_outlook_accounts(accounts, destination)
+        return {"path": destination, "count": len(accounts)}
+
+    def open_outlook_accounts_import_dialog(self):
+        if self.is_running or self.sso_convert_running or self.outlook_test_running:
+            self.log("[!] 当前有任务运行，请结束后再导入 Outlook 账号")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("粘贴 Outlook 账号")
+        dialog.configure(bg=UI_BG)
+        dialog.geometry("760x380")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        tk.Label(
+            dialog,
+            text="每行：email----password----client_id----refresh_token",
+            bg=UI_BG,
+            fg=UI_FG,
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=12, pady=(12, 6))
+        editor = scrolledtext.ScrolledText(
+            dialog,
+            height=12,
+            bg="#111111",
+            fg="#f5f5f5",
+            insertbackground="#f5f5f5",
+            wrap=tk.NONE,
+        )
+        editor.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+        actions = tk.Frame(dialog, bg=UI_BG)
+        actions.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+        def _save():
+            try:
+                result = self._import_outlook_accounts_text(editor.get("1.0", tk.END))
+            except outlook_provider.OutlookError as exc:
+                messagebox.showerror("Outlook 账号格式错误", str(exc), parent=dialog)
+                return
+            except OSError as exc:
+                messagebox.showerror("Outlook 账号保存失败", str(exc), parent=dialog)
+                return
+            editor.delete("1.0", tk.END)
+            dialog.destroy()
+            self.log(f"[*] 已导入 Outlook 账号 {result['count']} 个")
+
+        tk_button(actions, text="保存并使用", command=_save).pack(side=tk.RIGHT)
+        tk_button(actions, text="取消", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+
+    def test_outlook_connection(self):
+        if self.is_running or self.sso_convert_running or self.outlook_test_running:
+            self.log("[!] 当前有任务运行，请结束后再测试 Outlook")
+            return
+        raw_path = self.outlook_accounts_file_var.get().strip()
+        expanded = os.path.expanduser(raw_path)
+        path = expanded if os.path.isabs(expanded) else os.path.join(APP_DIR, expanded)
+        try:
+            accounts = outlook_provider.load_accounts_file(path)
+        except outlook_provider.OutlookError as exc:
+            self.log(f"[!] Outlook 账号文件读取失败: {exc}")
+            return
+        self._set_outlook_accounts(accounts, raw_path)
+        self.outlook_test_running = True
+        self.outlook_test_btn.config(state=tk.DISABLED)
+        self.outlook_browse_btn.config(state=tk.DISABLED)
+        self.outlook_import_btn.config(state=tk.DISABLED)
+        self.start_btn.config(state=tk.DISABLED)
+        proxy = self.proxy_var.get().strip()
+        self.log(f"[*] Outlook Graph 连接测试开始，共 {len(accounts)} 个账号")
+
+        def _job():
+            success = 0
+            failed = 0
+            for index, account in enumerate(accounts, 1):
+                self.log(f"[Outlook] [{index}/{len(accounts)}] 检查 {account.email} ...")
+                try:
+                    result = outlook_provider.check_account(account, proxy=proxy, top=5)
+                    success += 1
+                    self.log(
+                        f"[Outlook] [OK] {account.email}: Graph 可用，"
+                        f"读取最近邮件 {result['message_count']}"
+                    )
+                except outlook_provider.OutlookError as exc:
+                    failed += 1
+                    self.log(f"[Outlook] [FAIL] {account.email}: {exc}")
+                except Exception as exc:
+                    failed += 1
+                    self.log(f"[Outlook] [FAIL] {account.email}: {type(exc).__name__}")
+            self.ui_queue.put((self._on_outlook_test_done, (success, failed, len(accounts))))
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _on_outlook_test_done(self, success, failed, total):
+        self.outlook_test_running = False
+        self.outlook_count_var.set(f"有效账号：{total} | 连接成功：{success} | 失败：{failed}")
+        self.outlook_test_btn.config(state=tk.NORMAL)
+        self.outlook_browse_btn.config(state=tk.NORMAL)
+        self.outlook_import_btn.config(state=tk.NORMAL)
+        self.start_btn.config(state=tk.NORMAL)
+        self.log(f"[*] Outlook 检查完成：成功 {success}，失败 {failed}")
 
     def _refresh_cpa_fields(self):
         """未开启 SSO→auth 时隐藏 CPA 目录/远程配置。"""
@@ -2611,6 +2908,10 @@ class GrokRegisterGUI:
         self.start_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
         self.sso_convert_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
+        for name in ("outlook_test_btn", "outlook_browse_btn", "outlook_import_btn"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.config(state=tk.DISABLED if busy else tk.NORMAL)
         self.status_var.set("运行中..." if running else "就绪")
         self.status_label.config(foreground="blue" if running else "green")
 
@@ -2680,6 +2981,9 @@ class GrokRegisterGUI:
             pass
 
     def start_registration(self):
+        if self.outlook_test_running:
+            self.log("[!] Outlook 连接测试正在运行")
+            return
         if self.is_running:
             self.log("[!] 当前已有任务在运行")
             return
@@ -2710,6 +3014,7 @@ class GrokRegisterGUI:
         config["cloudmail_url"] = self.cloudmail_url_var.get().strip()
         config["cloudmail_admin_email"] = self.cloudmail_admin_email_var.get().strip()
         config["cloudmail_password"] = self.cloudmail_password_var.get()
+        config["outlook_accounts_file"] = self.outlook_accounts_file_var.get().strip()
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
@@ -2753,6 +3058,13 @@ class GrokRegisterGUI:
         except Exception:
             workers = 1
         workers = max(1, min(workers, 8, count))
+        if _is_outlook_provider():
+            try:
+                runtime = _initialize_outlook_batch_runtime(count=count, log_callback=self.log)
+            except outlook_provider.OutlookError as exc:
+                self.log(f"[!] Outlook 账号池初始化失败: {exc}")
+                return
+            self.outlook_count_var.set(f"有效账号：{runtime.available_count} | 本批目标：{count}")
         config["register_count"] = count
         config["register_workers"] = workers
         save_config()
@@ -2865,6 +3177,8 @@ class GrokRegisterGUI:
                 self._finish_nsfw_batch()
             except Exception as exc:
                 self.log(f"[NSFW] [!] 本批收尾异常: {exc}")
+            if _is_outlook_provider():
+                _clear_outlook_batch_runtime()
             self._set_running_ui(False)
             self.log(
                 f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
@@ -2937,6 +3251,7 @@ class GrokRegisterGUI:
 
     def run_registration(self, count, worker_id=0, workers=1):
         prefix = f"[W{worker_id + 1}] " if workers > 1 else ""
+        outlook_mode = _is_outlook_provider()
 
         def wlog(message):
             text = str(message)
@@ -2967,10 +3282,11 @@ class GrokRegisterGUI:
                 wlog("[*] 协议注册模式：不启动注册页浏览器")
             i = 0
             retry_count_for_slot = 0
-            max_slot_retry = 3
+            max_slot_retry = 0 if outlook_mode else 3
             while i < count:
                 if self.should_stop():
                     break
+                outlook_lease_id = ""
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
                 try:
                     email, password, sso, profile = register_account_once(
@@ -2981,6 +3297,8 @@ class GrokRegisterGUI:
                         profile = {"password": password}
                     elif password and not profile.get("password"):
                         profile["password"] = password
+                    if outlook_mode:
+                        outlook_lease_id = str(profile.pop("_outlook_lease_id", "") or "")
                     try:
                         line = f"{email}----{profile.get('password','') or password}----{sso}\n"
                         alock = getattr(self, "_accounts_lock", None)
@@ -3001,6 +3319,8 @@ class GrokRegisterGUI:
                             self.results.append({"email": email, "sso": sso, "profile": profile})
                     else:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
+                    if outlook_mode:
+                        _settle_outlook_lease(outlook_lease_id, True)
                     if config.get("enable_nsfw", True):
                         self._submit_nsfw(email, sso, log_callback=wlog)
                     cpa_ok = add_sso_to_cpa(
@@ -3026,16 +3346,28 @@ class GrokRegisterGUI:
                             log_callback=wlog,
                             reason=f"已成功 {self.success_count} 个账号，执行定期清理",
                         )
-                except RegistrationCancelled:
+                except RegistrationCancelled as exc:
+                    if outlook_mode:
+                        _settle_outlook_lease(
+                            outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                        )
                     wlog("[!] 注册被用户停止")
                     break
                 except EmailDomainRejected as exc:
+                    if outlook_mode:
+                        _settle_outlook_lease(
+                            outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                        )
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
                     wlog(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                     wlog("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
                 except AccountRetryNeeded as exc:
+                    if outlook_mode:
+                        _settle_outlook_lease(
+                            outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                        )
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
                         wlog(
@@ -3049,6 +3381,10 @@ class GrokRegisterGUI:
                         retry_count_for_slot = 0
                         i += 1
                 except Exception as exc:
+                    if outlook_mode:
+                        _settle_outlook_lease(
+                            outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                        )
                     kind = self._record_failure(exc)
                     retry_count_for_slot = 0
                     i += 1
@@ -3105,6 +3441,7 @@ def run_registration_cli(count):
     nsfw_worker = None
     sigint_received = False
     sigint_notice_logged = False
+    outlook_mode = _is_outlook_provider()
 
     # 一次 Ctrl+C 可靠置停：SIGINT 处理器直接设停止标志，不依赖异常在
     # curl_cffi C 回调里向上传播（那里 KeyboardInterrupt 会被吞掉，导致
@@ -3126,12 +3463,22 @@ def run_registration_cli(count):
     fail_count = 0
     fail_stats = empty_fail_stats()
     retry_count_for_slot = 0
-    max_slot_retry = 3
+    max_slot_retry = 0 if outlook_mode else 3
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
     workers = max(1, min(int(config.get("register_workers", 1) or 1), 8, int(count or 1)))
+    if outlook_mode:
+        try:
+            _initialize_outlook_batch_runtime(count=count, log_callback=cli_log)
+        except outlook_provider.OutlookError as exc:
+            cli_log(f"[!] Outlook 账号池初始化失败: {exc}")
+            try:
+                signal.signal(signal.SIGINT, _prev_sigint)
+            except Exception:
+                pass
+            return
     cli_log(f"[*] 终端模式启动，目标数量: {count} | 并发: {workers}")
     cli_log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
@@ -3288,6 +3635,7 @@ def run_registration_cli(count):
                 i = 0
                 retry = 0
                 while i < n and not controller.should_stop():
+                    outlook_lease_id = ""
                     try:
                         email, password, sso, profile = register_account_once(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
@@ -3297,6 +3645,8 @@ def run_registration_cli(count):
                             profile = {"password": password}
                         elif password and not profile.get("password"):
                             profile["password"] = password
+                        if outlook_mode:
+                            outlook_lease_id = str(profile.pop("_outlook_lease_id", "") or "")
                         line = f"{email}----{profile.get('password','') or password}----{sso}\n"
                         try:
                             with accounts_lock:
@@ -3312,6 +3662,8 @@ def run_registration_cli(count):
                                 log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             )
                             raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                        if outlook_mode:
+                            _settle_outlook_lease(outlook_lease_id, True)
                         _submit_cli_nsfw(email, sso, prefix=f"[W{wid+1}] ")
                         cpa_ok = add_sso_to_cpa(
                             sso,
@@ -3326,9 +3678,17 @@ def run_registration_cli(count):
                             cli_log(f"[W{wid+1}] [+] 注册成功: {email}")
                         else:
                             cli_log(f"[W{wid+1}] [+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
-                    except RegistrationCancelled:
+                    except RegistrationCancelled as exc:
+                        if outlook_mode:
+                            _settle_outlook_lease(
+                                outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                            )
                         break
                     except EmailDomainRejected as exc:
+                        if outlook_mode:
+                            _settle_outlook_lease(
+                                outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                            )
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
@@ -3336,6 +3696,10 @@ def run_registration_cli(count):
                         retry = 0
                         cli_log(f"[W{wid+1}] [-] 域名拒绝: {exc}")
                     except AccountRetryNeeded as exc:
+                        if outlook_mode:
+                            _settle_outlook_lease(
+                                outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                            )
                         retry += 1
                         if retry > max_slot_retry:
                             kind = classify_failure(exc)
@@ -3345,6 +3709,10 @@ def run_registration_cli(count):
                             retry = 0
                             cli_log(f"[W{wid+1}] [-] 卡住跳过: {exc}")
                     except Exception as exc:
+                        if outlook_mode:
+                            _settle_outlook_lease(
+                                outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                            )
                         kind = classify_failure(exc)
                         local_fail_stats[kind] = local_fail_stats.get(kind, 0) + 1
                         local_fail += 1
@@ -3385,7 +3753,11 @@ def run_registration_cli(count):
         except KeyboardInterrupt:
             controller.stop()
             cli_log("[!] 强制中断多并发任务")
-            _finish_cli_nsfw()
+            try:
+                _finish_cli_nsfw()
+            finally:
+                if outlook_mode:
+                    _clear_outlook_batch_runtime()
             try:
                 signal.signal(signal.SIGINT, _prev_sigint)
             except Exception:
@@ -3394,7 +3766,11 @@ def run_registration_cli(count):
         success_count = shared["success"]
         fail_count = shared["fail"]
         fail_stats = shared["fail_stats"]
-        _finish_cli_nsfw()
+        try:
+            _finish_cli_nsfw()
+        finally:
+            if outlook_mode:
+                _clear_outlook_batch_runtime()
         cli_log(
             f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}"
             + (f" | {format_fail_stats(fail_stats)}" if fail_count else "")
@@ -3425,6 +3801,7 @@ def run_registration_cli(count):
         while i < count:
             if controller.should_stop():
                 break
+            outlook_lease_id = ""
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
             try:
                 email, password, sso, profile = register_account_once(
@@ -3435,6 +3812,8 @@ def run_registration_cli(count):
                     profile = {"password": password}
                 elif password and not profile.get("password"):
                     profile["password"] = password
+                if outlook_mode:
+                    outlook_lease_id = str(profile.pop("_outlook_lease_id", "") or "")
                 try:
                     line = f"{email}----{profile.get('password','') or password}----{sso}\n"
                     with open(accounts_output_file, "a", encoding="utf-8") as f:
@@ -3443,6 +3822,8 @@ def run_registration_cli(count):
                     cli_log(f"[!] 保存账号文件失败，当前账号不计为成功: {file_exc}")
                     _append_sso_pending(email, sso, log_callback=cli_log)
                     raise RuntimeError(f"保存账号文件失败: {file_exc}") from file_exc
+                if outlook_mode:
+                    _settle_outlook_lease(outlook_lease_id, True)
                 _submit_cli_nsfw(email, sso)
                 cpa_ok = add_sso_to_cpa(
                     sso,
@@ -3463,16 +3844,28 @@ def run_registration_cli(count):
                         log_callback=cli_log,
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
-            except RegistrationCancelled:
+            except RegistrationCancelled as exc:
+                if outlook_mode:
+                    _settle_outlook_lease(
+                        outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                    )
                 cli_log("[!] 注册被停止")
                 break
             except EmailDomainRejected as exc:
+                if outlook_mode:
+                    _settle_outlook_lease(
+                        outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                    )
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[-] 邮箱域名被 xAI 拒绝 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
                 cli_log("[!] 请更换邮箱提供商或域名（如 Cloudflare 自建域 / MailNest），公共临时域常被拉黑")
             except AccountRetryNeeded as exc:
+                if outlook_mode:
+                    _settle_outlook_lease(
+                        outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                    )
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
                     cli_log(
@@ -3484,6 +3877,10 @@ def run_registration_cli(count):
                     i += 1
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过 [{FAIL_LABELS.get(kind, kind)}]: {exc}")
             except Exception as exc:
+                if outlook_mode:
+                    _settle_outlook_lease(
+                        outlook_lease_id or getattr(exc, "outlook_lease_id", ""), False
+                    )
                 kind = _cli_record_failure(exc)
                 retry_count_for_slot = 0
                 i += 1
@@ -3520,6 +3917,8 @@ def run_registration_cli(count):
             _finish_cli_nsfw()
         except BaseException as exc:
             cli_log(f"[NSFW] [!] 本批收尾异常: {exc}")
+        if outlook_mode:
+            _clear_outlook_batch_runtime()
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except Exception:

@@ -70,6 +70,16 @@ cp config.example.json config.json
 1. 按 [DEPLOYMENT.md](DEPLOYMENT.md) 用 Python 3.13 创建 `.venv` 并安装依赖
 2. 双击 `start-gui.cmd` 开图形界面，或 `start-cli.cmd` 开命令行（输入 `start` 开始）
 
+### macOS 一键启动
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+cp config.example.json config.json
+```
+
+双击 `start-gui.command` 开图形界面，或 `start-cli.command` 开命令行（输入 `start` 开始）。若通过压缩包下载后丢失可执行权限，先运行 `chmod +x start-*.command`。
+
 ## 配置
 
 | 配置项 | 说明 |
@@ -81,7 +91,8 @@ cp config.example.json config.json
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `mailnest` / `cloudmail` |
+| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `mailnest` / `cloudmail` / `outlook` |
+| `outlook_accounts_file` | Outlook OAuth2 账号文件路径，支持 TXT/JSON；默认 `outlook_accounts.json` |
 | `duckmail_api_base` | DuckMail/Mail.tm API 根地址，默认 `https://api.duckmail.sbs`；Mail.tm 填 `https://api.mail.tm` |
 | `duckmail_api_key` | DuckMail API Key（`dk_...`）；Mail.tm 公共接口可不填 |
 | `mailnest_api_key` | MailNest（迈巢 Outlook）API Key |
@@ -219,6 +230,41 @@ GUI「YYDS 收信域名」可填；留空则自动选择。
 ```
 
 `cloudmail_url` 填站点根地址，不要附加 `/api`。也可用环境变量 `CLOUDMAIL_URL` / `CLOUDMAIL_ADMIN_EMAIL` / `CLOUDMAIL_PASSWORD`（优先于 config）。
+
+### Outlook OAuth2（Microsoft Graph）
+
+使用自有 Outlook OAuth2 账号接收验证码。程序用 `client_id` 和 `refresh_token` 换取 Microsoft Graph access token，再读取当前账号的新邮件；每个注册任务持有独立账号租约，并发时不会串号。
+
+TXT 每行一个账号：
+
+```text
+email----password----client_id----refresh_token
+```
+
+`password` 仅兼容原始 auth 格式，解析后会被丢弃，不参与 Graph 收信，也不会写入导出的 JSON。账号也可使用 `outlook_oauth2.example.json` 所示的 JSON 格式。
+
+**GUI 用法**
+
+1. 邮箱服务商选择 `outlook`
+2. 点击「粘贴账号」直接粘贴多行 auth，或点击「选择 TXT/JSON」导入文件
+3. 可先点击「测试 Outlook 连接」，再设置注册数量和并发数开始注册
+
+粘贴导入会生成不含密码的 `outlook_accounts.json`；该文件包含 refresh token，已默认加入 `.gitignore`。
+
+**CLI 用法**
+
+在 `config.json` 中指定 TXT 或 JSON 账号文件：
+
+```json
+{
+  "email_provider": "outlook",
+  "outlook_accounts_file": "outlook_accounts.txt",
+  "register_count": 5,
+  "register_workers": 5
+}
+```
+
+运行 `start-cli.command`（macOS）或 `start-cli.cmd`（Windows），输入 `start`。GUI 和 CLI 都使用 `register_workers` 控制并发，实际并发不超过注册数量和项目上限 8；注册数量不能超过导入的有效 Outlook 账号数。成功取得 SSO 后继续使用原项目的 NSFW 与 CPA 入库流程。
 
 ## CPA 自动入库
 
@@ -419,6 +465,8 @@ curl -H "Authorization: Bearer <管理密钥>" \
 ├── requirements.txt
 ├── start-gui.cmd
 ├── start-cli.cmd
+├── start-gui.command
+├── start-cli.command
 ├── DEPLOYMENT.md
 ├── tests/
 └── assets/banner.png

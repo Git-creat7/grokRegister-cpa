@@ -1,0 +1,8 @@
+[
+  {
+    "email": "your-account@outlook.com",
+    "client_id": "your-public-client-id",
+    "refresh_token": "paste-your-refresh-token-locally",
+    "tenant": "consumers"
+  }
+]

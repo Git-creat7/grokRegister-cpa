@@ -5,4 +5,5 @@
 - yyds: YYDS
 - mailnest: 迈巢 Outlook
 - cloudmail: maillab/cloud-mail
+- outlook: 自有 Outlook OAuth2 / Microsoft Graph 收信
 """

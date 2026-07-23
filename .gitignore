@@ -17,6 +17,10 @@ config.local.json
 config.local.*
 *.bak
 
+# 本地 Outlook OAuth2 账号文件（包含 refresh_token）
+outlook_accounts.json
+outlook_accounts.txt
+
 # 真实账号凭证 / OAuth token 输出，禁止提交
 auth_out.json
 auth_out/
