@@ -52,16 +52,23 @@ _tls = threading.local()
 _get_proxy: Optional[Callable[[], dict]] = None
 _extension_path: str = ""
 _keep_windows_background: bool = False
+_headless: bool = False
 _start_fail_lock = threading.Lock()
 _start_fail_streak = 0
 _start_fail_threshold = 3
 
 
-def configure(get_proxies=None, extension_path="", keep_windows_background=False):
-    global _get_proxy, _extension_path, _keep_windows_background
+def configure(
+    get_proxies=None,
+    extension_path="",
+    keep_windows_background=False,
+    headless=False,
+):
+    global _get_proxy, _extension_path, _keep_windows_background, _headless
     _get_proxy = get_proxies
     _extension_path = extension_path or ""
     _keep_windows_background = bool(keep_windows_background)
+    _headless = bool(headless)
 
 
 def get_start_fail_streak() -> int:
@@ -134,7 +141,7 @@ def _get_foreground_window() -> int:
 
 
 def _send_windows_to_back(process_ids: set[int], last_external_hwnd=0) -> tuple[int, int]:
-    """将指定进程的可见顶层窗口置底，并返回最新非浏览器前台窗口。"""
+    """将指定进程的可见顶层窗口置底/移出屏幕/最小化，并返回最新非浏览器前台窗口。"""
     if os.name != "nt":
         return int(last_external_hwnd or 0), 0
 
@@ -144,7 +151,8 @@ def _send_windows_to_back(process_ids: set[int], last_external_hwnd=0) -> tuple[
     def _collect(hwnd, _):
         pid = wintypes.DWORD()
         _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if int(pid.value) in process_ids and _user32.IsWindowVisible(hwnd):
+        # 含最小化窗口（仍可能闪任务栏），一并处理
+        if int(pid.value) in process_ids:
             browser_windows.append(int(hwnd))
         return True
 
@@ -153,13 +161,29 @@ def _send_windows_to_back(process_ids: set[int], last_external_hwnd=0) -> tuple[
     if current_foreground and current_foreground not in browser_handles:
         last_external_hwnd = current_foreground
 
-    flags = 0x0001 | 0x0002 | 0x0010 | 0x4000  # NOSIZE|NOMOVE|NOACTIVATE|ASYNC
+    # SWP_NOSIZE=0x0001 SWP_NOMOVE=0x0002 SWP_NOACTIVATE=0x0010 SWP_ASYNCWINDOWPOS=0x4000
+    # SWP_HIDEWINDOW=0x0080 SWP_SHOWWINDOW=0x0040
+    flags_bottom = 0x0001 | 0x0002 | 0x0010 | 0x4000
+    # 移到屏外：不激活
+    flags_move = 0x0010 | 0x4000
+    SW_MINIMIZE = 6
+    SW_HIDE = 0
     moved = 0
     for hwnd in browser_windows:
-        if _user32.SetWindowPos(
-            hwnd, wintypes.HWND(1), 0, 0, 0, 0, flags
-        ):  # HWND_BOTTOM
-            moved += 1
+        try:
+            # 先最小化，再移出屏幕，再置底
+            _user32.ShowWindow(hwnd, SW_MINIMIZE)
+            _user32.SetWindowPos(
+                hwnd, wintypes.HWND(1), -32000, -32000, 1, 1, flags_move
+            )
+            if _user32.SetWindowPos(
+                hwnd, wintypes.HWND(1), 0, 0, 0, 0, flags_bottom
+            ):  # HWND_BOTTOM
+                moved += 1
+            # 彻底隐藏（仍保持进程，CF 路径可用有界面内核）
+            _user32.ShowWindow(hwnd, SW_HIDE)
+        except Exception:
+            pass
 
     if (
         current_foreground in browser_handles
@@ -314,6 +338,22 @@ def create_browser_options(unique_profile=True):
         options.auto_port()
     if _extension_path and os.path.exists(_extension_path):
         options.add_extension(_extension_path)
+    if _headless:
+        try:
+            options.headless(True)
+        except Exception:
+            options.set_argument("--headless=new")
+        options.set_argument("--disable-gpu")
+        options.set_argument("--window-size=1280,900")
+        options.set_argument("--no-sandbox")
+        options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-blink-features=AutomationControlled")
+    elif _keep_windows_background:
+        # 有界面内核过 CF，但启动即屏外+最小化，尽量不闪窗
+        options.set_argument("--window-position=-32000,-32000")
+        options.set_argument("--window-size=800,600")
+        options.set_argument("--start-minimized")
+        options.set_argument("--disable-blink-features=AutomationControlled")
     return options
 
 

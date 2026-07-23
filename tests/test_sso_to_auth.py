@@ -259,17 +259,18 @@ class ExtractNextActionTests(unittest.TestCase):
         )
         self.assertEqual(s2a._parse_consent_code(body), "abcXYZ123")
 
-    def test_sso_to_token_uses_fast_action_without_scanning_chunks(self):
+    def test_sso_to_token_device_flow_happy_path(self):
         class FakeCookies:
             def set(self, *args, **kwargs):
                 return None
 
         class FakeResponse:
-            def __init__(self, url, text="", status_code=200, payload=None):
+            def __init__(self, url, text="", status_code=200, payload=None, headers=None):
                 self.url = url
                 self.text = text
                 self.status_code = status_code
                 self._payload = payload or {}
+                self.headers = headers or {}
 
             def json(self):
                 return self._payload
@@ -279,38 +280,90 @@ class ExtractNextActionTests(unittest.TestCase):
                 self.cookies = FakeCookies()
                 self.proxies = None
                 self.posts = []
+                self.gets = []
 
             def get(self, url, **kwargs):
-                if url == "https://accounts.x.ai/":
-                    return FakeResponse(url)
-                return FakeResponse("https://accounts.x.ai/oauth2/consent?request=1")
+                self.gets.append(url)
+                if "openid-configuration" in url:
+                    return FakeResponse(
+                        url,
+                        payload={
+                            "device_authorization_endpoint": "https://auth.x.ai/oauth2/device/auth",
+                            "token_endpoint": "https://auth.x.ai/oauth2/token",
+                        },
+                    )
+                return FakeResponse("https://accounts.x.ai/")
 
             def post(self, url, **kwargs):
-                self.posts.append((url, kwargs))
+                self.posts.append(url)
+                if url.endswith("/oauth2/device/auth") or "device/auth" in url or url.endswith("/device_authorization"):
+                    return FakeResponse(
+                        url,
+                        payload={
+                            "device_code": "dev-code",
+                            "user_code": "ABCD-EFGH",
+                            "verification_uri": "https://accounts.x.ai/oauth2/device",
+                            "expires_in": 600,
+                            "interval": 1,
+                        },
+                    )
+                if "device/verify" in url:
+                    return FakeResponse(
+                        url,
+                        status_code=302,
+                        headers={"Location": "/oauth2/device/consent?user_code=ABCD-EFGH"},
+                    )
+                if "device/approve" in url:
+                    return FakeResponse(
+                        url,
+                        status_code=200,
+                        text="Device authorized",
+                        headers={"Location": "/oauth2/device/done"},
+                    )
                 if "/oauth2/token" in url:
                     return FakeResponse(
                         url,
-                        payload={"access_token": "not-a-jwt", "expires_in": 21600},
+                        payload={
+                            "access_token": "not-a-jwt",
+                            "refresh_token": "rt",
+                            "expires_in": 21600,
+                            "token_type": "Bearer",
+                        },
                     )
-                return FakeResponse(
-                    url,
-                    text='1:{"success":true,"code":"fast-code"}',
-                )
+                return FakeResponse(url, status_code=500, text="unexpected")
 
         session = FakeSession()
-        original_action = s2a._working_next_action_id
-        s2a._working_next_action_id = s2a.NEXT_ACTION_ID
-        try:
-            with patch.object(s2a.requests, "Session", return_value=session), patch.object(
-                s2a, "_discover_action_ids_from_js", side_effect=AssertionError("should not scan")
-            ):
-                token = s2a.sso_to_token("valid-sso", log=lambda message: None)
-        finally:
-            s2a._working_next_action_id = original_action
+        with patch.object(s2a.requests, "Session", return_value=session):
+            token = s2a.sso_to_token("valid-sso", log=lambda message: None)
 
         self.assertIsNotNone(token)
-        consent_headers = session.posts[0][1]["headers"]
-        self.assertEqual(consent_headers["Next-Action"], s2a.NEXT_ACTION_ID)
+        self.assertEqual(token.get("access_token"), "not-a-jwt")
+        self.assertEqual(token.get("refresh_token"), "rt")
+        self.assertTrue(any("device/auth" in u or "device_authorization" in u for u in session.posts))
+        self.assertTrue(any("device/verify" in u for u in session.posts))
+        self.assertTrue(any("device/approve" in u for u in session.posts))
+        self.assertTrue(any("/oauth2/token" in u for u in session.posts))
+        # Device flow must not inject referrer authorize params
+        self.assertNotIn("referrer=grok-build", " ".join(session.posts))
+
+    def test_token_to_cpa_record_matches_healthy_headers(self):
+        record = s2a.token_to_cpa_record(
+            {
+                "access_token": "a.b.c",
+                "refresh_token": "r",
+                "expires_in": 1,
+                "token_type": "Bearer",
+            },
+            email="user@example.com",
+            sso="should-not-write",
+        )
+        self.assertEqual(record["headers"]["x-grok-client-identifier"], "grok-shell")
+        self.assertEqual(record["headers"]["x-compaction-at"], "400000")
+        self.assertNotIn("sso", record)
+        self.assertNotIn("redirect_uri", record)
+        self.assertNotIn("disabled", record)
+        self.assertEqual(s2a.SCOPES, "openid profile email offline_access grok-cli:access api:access")
+        self.assertEqual(s2a.GROK_REFERRER, "")
 
 
 if __name__ == "__main__":

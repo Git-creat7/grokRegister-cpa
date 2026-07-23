@@ -73,6 +73,7 @@ from register_flow import (
     fill_profile_and_submit,
     wait_for_sso_cookie,
 )
+import protocol_signup as _protocol
 
 
 
@@ -165,6 +166,8 @@ DEFAULT_CONFIG = {
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
     "yyds_default_domain": "",
+    # 协议 HTTP 注册（对齐 grok-register-new）：默认开启，避免浏览器 UI 打 bot 标
+    "register_mode": "protocol",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -484,6 +487,59 @@ def _append_sso_pending(email: str, sso: str, log_callback=None):
             log_callback(f"[CPA] 写入 sso_pending 失败: {exc}")
 
 
+def use_protocol_register() -> bool:
+    mode = str(config.get("register_mode", "protocol") or "protocol").strip().lower()
+    env = str(os.environ.get("GROK_REGISTER_MODE", "") or "").strip().lower()
+    if env:
+        mode = env
+    return mode in ("protocol", "http", "api", "1", "true", "yes")
+
+
+def register_account_once(log_callback=None, cancel_callback=None):
+    """注册一个账号，返回 (email, password, sso, profile)。
+
+    默认走纯 HTTP 协议路径（无注册页浏览器）；register_mode=browser 时回退 UI 路径。
+    """
+    if use_protocol_register():
+        proxy = _resolve_cpa_proxy()
+        if log_callback:
+            log_callback("[*] 注册模式: protocol（无注册页浏览器）")
+        result = _protocol.register_one(
+            get_email_and_token=get_email_and_token,
+            get_oai_code=get_oai_code,
+            proxy=proxy,
+            log=log_callback,
+            should_stop=cancel_callback,
+        )
+        return (
+            result["email"],
+            result.get("password", ""),
+            result["sso"],
+            result.get("profile") or {},
+        )
+
+    if log_callback:
+        log_callback("[*] 注册模式: browser（DrissionPage UI）")
+    open_signup_page(log_callback=log_callback, cancel_callback=cancel_callback)
+    email, dev_token = fill_email_and_submit(
+        log_callback=log_callback, cancel_callback=cancel_callback
+    )
+    code = fill_code_and_submit(
+        email,
+        dev_token,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+    )
+    del code
+    profile = fill_profile_and_submit(
+        log_callback=log_callback, cancel_callback=cancel_callback
+    )
+    sso = wait_for_sso_cookie(
+        log_callback=log_callback, cancel_callback=cancel_callback
+    )
+    return email, profile.get("password", ""), sso, profile
+
+
 def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> bool:
     """SSO → 授权码流程换 token → 写入本地 CPA auth 目录和/或远程 CPA。
 
@@ -519,7 +575,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
         if should_stop and should_stop():
             _cpa_log("用户停止，跳过授权转换")
             return False
-        _cpa_log(f"SSO → 授权码流程换 token (proxy={proxy}) ...")
+        _cpa_log(f"SSO → Device Flow 换 token (proxy={proxy}) ...")
         token = _s2cpa.sso_to_token(
             sso,
             proxy=proxy,
@@ -530,7 +586,7 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
             if should_stop and should_stop():
                 _cpa_log("用户停止，SSO 已保存在 accounts 文件")
                 return False
-            _cpa_log("授权码流程换 token 失败；SSO 已在 accounts 文件，稍后可重转")
+            _cpa_log("Device Flow 换 token 失败；SSO 已在 accounts 文件，稍后可重转")
             _append_sso_pending(email, sso, log_callback=log_callback)
             return False
         if should_stop and should_stop():
@@ -539,10 +595,15 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
         record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
         ap = _s2cpa.decode_jwt_payload(record.get("access_token", ""))
         ref = ap.get("referrer")
-        if ref != "grok-build":
-            _cpa_log(f"警告: access_token referrer={ref!r}，预期 grok-build")
+        bot = ap.get("bot_flag_source")
+        scope = ap.get("scope")
+        if ref:
+            _cpa_log(f"警告: access_token 仍带 referrer={ref!r}（健康号应为空）")
         else:
-            _cpa_log("access_token referrer=grok-build OK")
+            _cpa_log("access_token 无 referrer（健康样式）")
+        if bot is not None:
+            _cpa_log(f"警告: bot_flag_source={bot!r}")
+        _cpa_log(f"scope={scope!r}")
         wrote_ok = False
         if auth_dir:
             try:
@@ -565,6 +626,16 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
             _cpa_log("token 已换出但本地/远程均未写入成功")
             _append_sso_pending(email, sso, log_callback=log_callback)
             return False
+        # 测活：对齐健康号路径，新 token 可能瞬时 403，内置 warmup+retry
+        try:
+            code, summary = _s2cpa.probe_cpa_record(
+                record, proxy=proxy, timeout=40, warmup=True, retries=3
+            )
+            _cpa_log(f"probe HTTP {code}: {(summary or '')[:160]}")
+            if code != 200:
+                _cpa_log("测活未通过，仍保留 auth（可稍后重试 probe）")
+        except Exception as probe_exc:
+            _cpa_log(f"probe 异常: {probe_exc}")
         return True
     except Exception as exc:
         if should_stop and should_stop():
@@ -1767,12 +1838,23 @@ def should_emit_log(message: str) -> bool:
     return True
 
 
-def _wire_runtime_modules(gui_mode=False):
+def _wire_runtime_modules(gui_mode=False, headless=None):
     """把主模块依赖注入到 browser_session / register_flow。"""
+    if headless is None:
+        env = str(os.environ.get("GROK_HEADLESS", "") or "").strip().lower()
+        if env in ("1", "true", "yes", "on"):
+            headless = True
+        elif env in ("0", "false", "no", "off"):
+            headless = False
+        else:
+            # 纯 headless 会被 Cloudflare 拦；默认用有界面但后台置底窗口
+            headless = False
+    keep_bg = (gui_mode or not headless)
     _bs.configure(
         get_proxies=get_proxies,
         extension_path=EXTENSION_PATH,
-        keep_windows_background=gui_mode,
+        keep_windows_background=keep_bg,
+        headless=bool(headless),
     )
     _rf.configure(
         get_email_and_token=get_email_and_token,
@@ -2749,21 +2831,25 @@ class GrokRegisterGUI:
                 self.log(text)
 
         try:
-            try:
-                start_browser(
-                    log_callback=wlog,
-                    cancel_callback=self.should_stop,
-                )
-            except Exception as boot_exc:
-                streak = get_start_fail_streak()
-                wlog(f"[-] 浏览器启动失败 (连续失败 {streak}): {boot_exc}")
-                if workers > 1 and streak >= 3:
-                    wlog("[!] 连续启动失败较多，建议降低并发后重试")
-                for _ in range(max(int(count or 0), 0)):
-                    self._record_failure(boot_exc)
-                self.update_stats()
-                return
-            wlog("[*] 浏览器已启动")
+            protocol = use_protocol_register()
+            if not protocol:
+                try:
+                    start_browser(
+                        log_callback=wlog,
+                        cancel_callback=self.should_stop,
+                    )
+                except Exception as boot_exc:
+                    streak = get_start_fail_streak()
+                    wlog(f"[-] 浏览器启动失败 (连续失败 {streak}): {boot_exc}")
+                    if workers > 1 and streak >= 3:
+                        wlog("[!] 连续启动失败较多，建议降低并发后重试")
+                    for _ in range(max(int(count or 0), 0)):
+                        self._record_failure(boot_exc)
+                    self.update_stats()
+                    return
+                wlog("[*] 浏览器已启动")
+            else:
+                wlog("[*] 协议注册模式：不启动注册页浏览器")
             i = 0
             retry_count_for_slot = 0
             max_slot_retry = 3
@@ -2772,67 +2858,16 @@ class GrokRegisterGUI:
                     break
                 wlog(f"--- 开始第 {i + 1}/{count} 个账号 ---")
                 try:
-                    email = ""
-                    dev_token = ""
-                    code = ""
-                    mail_ok = False
-                    max_mail_retry = 3
-                    for mail_try in range(1, max_mail_retry + 1):
-                        wlog(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                        open_signup_page(
-                            log_callback=wlog, cancel_callback=self.should_stop
-                        )
-                        wlog("[*] 2. 创建邮箱并提交")
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=wlog, cancel_callback=self.should_stop
-                        )
-                        wlog(f"[*] 邮箱: {email}")
-                        wlog(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ""))})")
-                        try:
-                            with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
-                        except Exception:
-                            pass
-                        wlog("[*] 3. 拉取验证码")
-                        try:
-                            code = fill_code_and_submit(
-                                email,
-                                dev_token,
-                                log_callback=wlog,
-                                cancel_callback=self.should_stop,
-                            )
-                            mail_ok = True
-                            break
-                        except Exception as mail_exc:
-                            msg = str(mail_exc)
-                            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                                wlog(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                                restart_browser(
-                                    log_callback=wlog,
-                                    cancel_callback=self.should_stop,
-                                )
-                                sleep_with_cancel(1, self.should_stop)
-                                continue
-                            raise
-
-                    if not mail_ok:
-                        raise Exception("验证码阶段失败，已达到最大重试次数")
-                    wlog(f"[*] 验证码: {code}")
-                    wlog("[*] 4. 填写资料")
-                    profile = fill_profile_and_submit(
-                        log_callback=wlog, cancel_callback=self.should_stop
+                    email, password, sso, profile = register_account_once(
+                        log_callback=wlog,
+                        cancel_callback=self.should_stop,
                     )
-                    wlog(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    wlog("[*] 5. 等待 sso cookie")
-                    sso = wait_for_sso_cookie(
-                        log_callback=wlog, cancel_callback=self.should_stop
-                    )
+                    if not profile:
+                        profile = {"password": password}
+                    elif password and not profile.get("password"):
+                        profile["password"] = password
                     try:
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
+                        line = f"{email}----{profile.get('password','') or password}----{sso}\n"
                         alock = getattr(self, "_accounts_lock", None)
                         if alock:
                             with alock:
@@ -2907,9 +2942,9 @@ class GrokRegisterGUI:
                     self.update_stats()
                     if self.should_stop():
                         break
-                    # 每轮结束只关浏览器，不立刻再开。
+                    # 浏览器模式：每轮结束只关浏览器；协议模式无常驻浏览器。
                     # 下一轮 open_signup_page 会按需启动并导航到官网，避免空浏览器残留。
-                    if i >= count:
+                    if i >= count or protocol:
                         continue
                     try:
                         stop_browser()
@@ -3059,43 +3094,31 @@ def run_registration_cli(count):
             local_fail = 0
             local_fail_stats = empty_fail_stats()
             try:
-                try:
-                    start_browser(
-                        log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                        cancel_callback=controller.should_stop,
-                    )
-                except Exception as boot_exc:
-                    local_fail = n
-                    local_fail_stats[FAIL_BROWSER] = local_fail_stats.get(FAIL_BROWSER, 0) + n
-                    cli_log(f"[W{wid+1}] [-] 浏览器启动失败，{n} 个任务均记为失败: {boot_exc}")
-                    return
+                protocol = use_protocol_register()
+                if not protocol:
+                    try:
+                        start_browser(
+                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
+                            cancel_callback=controller.should_stop,
+                        )
+                    except Exception as boot_exc:
+                        local_fail = n
+                        local_fail_stats[FAIL_BROWSER] = local_fail_stats.get(FAIL_BROWSER, 0) + n
+                        cli_log(f"[W{wid+1}] [-] 浏览器启动失败，{n} 个任务均记为失败: {boot_exc}")
+                        return
                 i = 0
                 retry = 0
                 while i < n and not controller.should_stop():
                     try:
-                        open_signup_page(
+                        email, password, sso, profile = register_account_once(
                             log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
                             cancel_callback=controller.should_stop,
                         )
-                        email, dev_token = fill_email_and_submit(
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        code = fill_code_and_submit(
-                            email,
-                            dev_token,
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        profile = fill_profile_and_submit(
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        sso = wait_for_sso_cookie(
-                            log_callback=lambda m: cli_log(f"[W{wid+1}] {m}"),
-                            cancel_callback=controller.should_stop,
-                        )
-                        line = f"{email}----{profile.get('password','')}----{sso}\n"
+                        if not profile:
+                            profile = {"password": password}
+                        elif password and not profile.get("password"):
+                            profile["password"] = password
+                        line = f"{email}----{profile.get('password','') or password}----{sso}\n"
                         try:
                             with accounts_lock:
                                 with open(accounts_output_file, "a", encoding="utf-8") as f:
@@ -3204,84 +3227,37 @@ def run_registration_cli(count):
         return
 
     try:
-        try:
-            start_browser(
-                log_callback=cli_log,
-                cancel_callback=controller.should_stop,
-            )
-        except Exception as boot_exc:
-            fail_count += count
-            fail_stats[FAIL_BROWSER] = fail_stats.get(FAIL_BROWSER, 0) + count
-            cli_log(f"[-] 浏览器启动失败，{count} 个任务均记为失败: {boot_exc}")
-            return
-        cli_log("[*] 浏览器已启动")
+        protocol = use_protocol_register()
+        if not protocol:
+            try:
+                start_browser(
+                    log_callback=cli_log,
+                    cancel_callback=controller.should_stop,
+                )
+            except Exception as boot_exc:
+                fail_count += count
+                fail_stats[FAIL_BROWSER] = fail_stats.get(FAIL_BROWSER, 0) + count
+                cli_log(f"[-] 浏览器启动失败，{count} 个任务均记为失败: {boot_exc}")
+                return
+            cli_log("[*] 浏览器已启动")
+        else:
+            cli_log("[*] 协议注册模式：不启动注册页浏览器")
         i = 0
         while i < count:
             if controller.should_stop():
                 break
             cli_log(f"--- 开始第 {i + 1}/{count} 个账号 ---")
             try:
-                email = ""
-                dev_token = ""
-                code = ""
-                mail_ok = False
-                max_mail_retry = 3
-                for mail_try in range(1, max_mail_retry + 1):
-                    cli_log(f"[*] 1. 打开注册页 (尝试 {mail_try}/{max_mail_retry})")
-                    open_signup_page(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log("[*] 2. 创建邮箱并提交")
-                    email, dev_token = fill_email_and_submit(
-                        log_callback=cli_log, cancel_callback=controller.should_stop
-                    )
-                    cli_log(f"[*] 邮箱: {email}")
-                    cli_log(f"[Debug] 邮箱 token 已获取 (len={len(str(dev_token or ""))})")
-                    try:
-                        with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
-                    except Exception:
-                        pass
-                    cli_log("[*] 3. 拉取验证码")
-                    try:
-                        code = fill_code_and_submit(
-                            email,
-                            dev_token,
-                            log_callback=cli_log,
-                            cancel_callback=controller.should_stop,
-                        )
-                        mail_ok = True
-                        break
-                    except Exception as mail_exc:
-                        msg = str(mail_exc)
-                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                            cli_log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
-                            restart_browser(
-                                log_callback=cli_log,
-                                cancel_callback=controller.should_stop,
-                            )
-                            sleep_with_cancel(1, controller.should_stop)
-                            continue
-                        raise
-
-                if not mail_ok:
-                    raise Exception("验证码阶段失败，已达到最大重试次数")
-                cli_log(f"[*] 验证码: {code}")
-                cli_log("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
+                email, password, sso, profile = register_account_once(
+                    log_callback=cli_log,
+                    cancel_callback=controller.should_stop,
                 )
-                cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                cli_log("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
+                if not profile:
+                    profile = {"password": password}
+                elif password and not profile.get("password"):
+                    profile["password"] = password
                 try:
-                    line = f"{email}----{profile.get('password','')}----{sso}\n"
+                    line = f"{email}----{profile.get('password','') or password}----{sso}\n"
                     with open(accounts_output_file, "a", encoding="utf-8") as f:
                         f.write(line)
                 except Exception as file_exc:
@@ -3390,21 +3366,29 @@ def run_registration_cli(count):
             pass
 
 
-def main_cli():
+def main_cli(auto_start: bool = False, headless: bool | None = None):
     load_config()
-    _wire_runtime_modules()
+    # 默认不用真 headless（CF 会拦），而是后台置底有界面浏览器
+    if headless is None:
+        headless = False
+    _wire_runtime_modules(gui_mode=False, headless=headless)
     count = int(config.get("register_count", 1) or 1)
     cli_log("[*] CLI 已加载配置")
-    cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
-    cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
-    try:
-        command = input("> ").strip().lower()
-    except KeyboardInterrupt:
-        cli_log("[!] 已取消")
-        return
-    if command != "start":
-        cli_log("[!] 未输入 start，已退出")
-        return
+    cli_log(
+        f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | "
+        f"注册数量: {count} | headless={bool(headless)} | "
+        f"background={bool(not headless)}"
+    )
+    if not auto_start:
+        cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
+        try:
+            command = input("> ").strip().lower()
+        except KeyboardInterrupt:
+            cli_log("[!] 已取消")
+            return
+        if command != "start":
+            cli_log("[!] 未输入 start，已退出")
+            return
     try:
         run_registration_cli(count)
     except KeyboardInterrupt:
@@ -3418,10 +3402,20 @@ def main():
     except OSError as exc:
         print(f"[日志] 无法创建日志文件: {exc}", flush=True)
     load_config()
-    _wire_runtime_modules()
-    if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
-        main_cli()
+    argv = [a.strip().lower() for a in sys.argv[1:]]
+    headless_flag = None
+    if "--headless" in argv or "headless" in argv:
+        headless_flag = True
+    if "--no-headless" in argv or "--show-browser" in argv:
+        headless_flag = False
+    auto_start = any(a in ("start", "--start", "auto") for a in argv)
+    if any(a in ("start", "cli", "--cli", "--start", "auto") for a in argv):
+        main_cli(
+            auto_start=auto_start or "start" in argv or "--start" in argv or "auto" in argv,
+            headless=headless_flag if headless_flag is not None else False,
+        )
         return
+    _wire_runtime_modules(gui_mode=True, headless=headless_flag)
     root = tk.Tk()
     setup_light_theme(root)
     app = GrokRegisterGUI(root)

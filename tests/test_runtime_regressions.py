@@ -13,14 +13,17 @@ class RuntimeRegressionTests(unittest.TestCase):
     def test_gui_runtime_wiring_keeps_browser_in_background(self):
         with patch.object(app._bs, "configure") as configure_browser, patch.object(
             app._rf, "configure"
-        ):
+        ), patch.dict(os.environ, {"GROK_HEADLESS": ""}, clear=False):
             app._wire_runtime_modules(gui_mode=True)
             gui_kwargs = configure_browser.call_args.kwargs
             app._wire_runtime_modules()
             cli_kwargs = configure_browser.call_args.kwargs
 
         self.assertTrue(gui_kwargs["keep_windows_background"])
-        self.assertFalse(cli_kwargs["keep_windows_background"])
+        self.assertFalse(gui_kwargs.get("headless"))
+        # CLI 默认后台置底有界面（真 headless 会被 CF 拦）
+        self.assertTrue(cli_kwargs["keep_windows_background"])
+        self.assertFalse(cli_kwargs.get("headless"))
 
     def setUp(self):
         self.original_config = app.config.copy()
@@ -105,6 +108,7 @@ class RuntimeRegressionTests(unittest.TestCase):
     def test_parallel_browser_start_failure_counts_all_tasks(self):
         app.config["register_workers"] = 2
         app.config["enable_nsfw"] = False
+        app.config["register_mode"] = "browser"
         logs = []
         previous_handler = signal.getsignal(signal.SIGINT)
         try:
@@ -146,22 +150,22 @@ class RuntimeRegressionTests(unittest.TestCase):
         gui.log = lambda message: None
         gui.update_stats = lambda: None
 
-        with patch.object(app, "start_browser", return_value=(object(), object())), patch.object(
-            app, "open_signup_page", return_value=None
-        ), patch.object(app, "fill_email_and_submit", return_value=("a@example.com", "mail-token")), patch.object(
-            app, "fill_code_and_submit", return_value="ABC-123"
-        ), patch.object(
+        with patch.object(
             app,
-            "fill_profile_and_submit",
-            return_value={"given_name": "A", "family_name": "B", "password": "secret"},
-        ), patch.object(app, "wait_for_sso_cookie", return_value="sso-token"), patch.object(
-            app, "maybe_stop_browser", return_value=None
-        ), patch.object(app, "stop_browser", return_value=None), patch.object(
-            app, "add_sso_to_cpa"
-        ) as add_to_cpa, patch.object(app, "_append_sso_pending") as append_pending, patch(
-            "builtins.open", side_effect=OSError("disk full")
-        ):
+            "register_account_once",
+            return_value=(
+                "a@example.com",
+                "secret",
+                "sso-token",
+                {"given_name": "A", "family_name": "B", "password": "secret"},
+            ),
+        ), patch.object(app, "maybe_stop_browser", return_value=None), patch.object(
+            app, "stop_browser", return_value=None
+        ), patch.object(app, "add_sso_to_cpa") as add_to_cpa, patch.object(
+            app, "_append_sso_pending"
+        ) as append_pending, patch("builtins.open", side_effect=OSError("disk full")):
             app.config["enable_nsfw"] = False
+            app.config["register_mode"] = "protocol"
             gui.run_registration(1)
 
         self.assertEqual(gui.success_count, 0)
@@ -188,22 +192,24 @@ class RuntimeRegressionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             gui.accounts_output_file = os.path.join(tmp, "accounts.txt")
-            with patch.object(app, "start_browser", return_value=(object(), object())), patch.object(
-                app, "open_signup_page", return_value=None
-            ), patch.object(app, "fill_email_and_submit", return_value=("a@example.com", "mail-token")), patch.object(
-                app, "fill_code_and_submit", return_value="ABC-123"
-            ), patch.object(
+            with patch.object(
                 app,
-                "fill_profile_and_submit",
-                return_value={"given_name": "A", "family_name": "B", "password": "secret"},
-            ), patch.object(app, "wait_for_sso_cookie", return_value="sso-token"), patch.object(
-                app, "maybe_stop_browser", return_value=None
-            ), patch.object(app, "add_sso_to_cpa", return_value=True) as add_to_cpa, patch.object(
+                "register_account_once",
+                return_value=(
+                    "a@example.com",
+                    "secret",
+                    "sso-token",
+                    {"given_name": "A", "family_name": "B", "password": "secret"},
+                ),
+            ), patch.object(app, "maybe_stop_browser", return_value=None), patch.object(
+                app, "add_sso_to_cpa", return_value=True
+            ) as add_to_cpa, patch.object(
                 app,
                 "enable_nsfw_for_token",
                 side_effect=AssertionError("registration worker must not enable NSFW synchronously"),
             ):
                 app.config["enable_nsfw"] = True
+                app.config["register_mode"] = "protocol"
                 gui.run_registration(1)
 
         self.assertEqual(gui.success_count, 1)
@@ -265,20 +271,20 @@ class RuntimeRegressionTests(unittest.TestCase):
         previous_handler = signal.getsignal(signal.SIGINT)
         try:
             with patch.object(app, "create_nsfw_retry_worker", return_value=worker) as create_worker, patch.object(
-                app, "start_browser", return_value=(object(), object())
-            ), patch.object(app, "open_signup_page"), patch.object(
-                app, "fill_email_and_submit", return_value=("a@example.com", "mail-token")
-            ), patch.object(app, "fill_code_and_submit", return_value="ABC-123"), patch.object(
                 app,
-                "fill_profile_and_submit",
-                return_value={"given_name": "A", "family_name": "B", "password": "secret"},
-            ), patch.object(app, "wait_for_sso_cookie", return_value="sso-token"), patch.object(
-                app, "add_sso_to_cpa", return_value=True
-            ), patch.object(app, "maybe_stop_browser"), patch.object(
-                app, "cleanup_runtime_memory"
-            ), patch.object(app, "enable_nsfw_for_token", side_effect=AssertionError("sync NSFW")), patch(
-                "builtins.open", mock_open()
-            ):
+                "register_account_once",
+                return_value=(
+                    "a@example.com",
+                    "secret",
+                    "sso-token",
+                    {"given_name": "A", "family_name": "B", "password": "secret"},
+                ),
+            ), patch.object(app, "add_sso_to_cpa", return_value=True), patch.object(
+                app, "maybe_stop_browser"
+            ), patch.object(app, "cleanup_runtime_memory"), patch.object(
+                app, "enable_nsfw_for_token", side_effect=AssertionError("sync NSFW")
+            ), patch("builtins.open", mock_open()):
+                app.config["register_mode"] = "protocol"
                 app.run_registration_cli(1)
         finally:
             signal.signal(signal.SIGINT, previous_handler)
@@ -290,6 +296,7 @@ class RuntimeRegressionTests(unittest.TestCase):
     def test_cli_sigint_handler_only_sets_stop_until_main_flow_logs(self):
         app.config["register_workers"] = 1
         app.config["enable_nsfw"] = False
+        app.config["register_mode"] = "browser"
         logs = []
         registered = {}
         previous_handler = signal.getsignal(signal.SIGINT)
@@ -332,20 +339,20 @@ class RuntimeRegressionTests(unittest.TestCase):
         previous_handler = signal.getsignal(signal.SIGINT)
         try:
             with patch.object(app, "create_nsfw_retry_worker", return_value=worker) as create_worker, patch.object(
-                app, "start_browser", return_value=(object(), object())
-            ), patch.object(app, "open_signup_page"), patch.object(
-                app, "fill_email_and_submit", return_value=("a@example.com", "mail-token")
-            ), patch.object(app, "fill_code_and_submit", return_value="ABC-123"), patch.object(
                 app,
-                "fill_profile_and_submit",
-                return_value={"given_name": "A", "family_name": "B", "password": "secret"},
-            ), patch.object(app, "wait_for_sso_cookie", return_value="sso-token"), patch.object(
-                app, "add_sso_to_cpa", return_value=True
-            ), patch.object(app, "maybe_stop_browser"), patch.object(
-                app, "stop_browser"
-            ), patch.object(app, "enable_nsfw_for_token", side_effect=AssertionError("sync NSFW")), patch(
-                "builtins.open", mock_open()
-            ):
+                "register_account_once",
+                return_value=(
+                    "a@example.com",
+                    "secret",
+                    "sso-token",
+                    {"given_name": "A", "family_name": "B", "password": "secret"},
+                ),
+            ), patch.object(app, "add_sso_to_cpa", return_value=True), patch.object(
+                app, "maybe_stop_browser"
+            ), patch.object(app, "stop_browser"), patch.object(
+                app, "enable_nsfw_for_token", side_effect=AssertionError("sync NSFW")
+            ), patch("builtins.open", mock_open()):
+                app.config["register_mode"] = "protocol"
                 app.run_registration_cli(2)
         finally:
             signal.signal(signal.SIGINT, previous_handler)

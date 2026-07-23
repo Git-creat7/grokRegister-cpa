@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-SSO cookie → CPA / grok auth.json 格式（纯 HTTP 授权码流程）
+SSO cookie → CPA / grok auth.json 格式（纯 HTTP Device Authorization Flow）
 
-对齐 grok-build-auth 的 CPA 导出格式；authorize 注入 referrer=grok-build + plan=generic，
-写出 CLIProxyAPI 扁平 xai-*.json（base_url=cli-chat-proxy.grok.com）。
+对齐 grok-register-new / 健康号：
+- Device Flow（无 referrer / plan / conversations scope）
+- CPA headers 使用 grok-shell + x-compaction-at
+- base_url=cli-chat-proxy.grok.com
 
 用法:
   # 单个 / 批量 SSO，写出多个独立 auth 文件（每个可直接 cp 到 ~/.grok/auth.json）
@@ -42,23 +44,24 @@ from curl_cffi import requests
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 OIDC_ISSUER = "https://auth.x.ai"
 AUTH_KEY = f"{OIDC_ISSUER}::{CLIENT_ID}"
-# 与当前可用号 JWT scope 对齐（含 conversations:*）
-SCOPES = (
-    "openid profile email offline_access grok-cli:access "
-    "api:access conversations:read conversations:write"
-)
+# 健康号 / grok-register-new scope（不含 conversations:*，不注入 referrer）
+SCOPES = "openid profile email offline_access grok-cli:access api:access"
 
-# --- Authorization Code Flow 常量 --------------------------------------------
-# authorize 必须注入 referrer=grok-build，否则 access_token 无该 claim，
-# cli-chat-proxy 会 403。实测 referrer=cli-proxy-api 会得到 referrer=None。
-# plan=generic 对齐 grok-build-auth；consent.referrer 仍置空。
+# --- Device Authorization Flow 常量 ------------------------------------------
+DISCOVERY_URL = f"{OIDC_ISSUER}/.well-known/openid-configuration"
+DEVICE_VERIFY_URL = f"{OIDC_ISSUER}/oauth2/device/verify"
+DEVICE_APPROVE_URL = f"{OIDC_ISSUER}/oauth2/device/approve"
+# 兼容旧调用方；Device Flow 不再使用 redirect / referrer / plan
 REDIRECT_URI = "http://127.0.0.1:56121/callback"
-GROK_REFERRER = "grok-build"
-GROK_PLAN = "generic"
+GROK_REFERRER = ""  # 已弃用：健康号 JWT 无 referrer claim
+GROK_PLAN = ""
 GROK_VERSION = "0.2.93"
-GROK_TOKEN_UA = f"grok-pager/{GROK_VERSION} grok-shell/{GROK_VERSION} (linux; x86_64)"
-# consent 提交用的 Next.js Server Action ID（快速路径；失效时再从 consent 页 JS 动态解析）
-# 2026-07 实测 createServerReference 在 accounts.x.ai chunks 内，HTML 里的 400b2e4e... 不是 consent allow
+GROK_TOKEN_UA = f"grok-shell/{GROK_VERSION} (linux; x86_64)"
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+)
+# 旧授权码 consent 路径遗留（仅作兼容，默认不再走）
 NEXT_ACTION_ID = "401b73e22a5e68737d0037e1aa449fef82cd1b35fb"
 _working_next_action_id = NEXT_ACTION_ID
 _NEXT_ACTION_RE = re.compile(
@@ -79,15 +82,17 @@ _SCRIPT_SRC_RE = re.compile(r'src=["\']([^"\']+)["\']', re.I)
 # CPA 的 internal/auth/xai/token.go TokenStorage 读的是扁平字段。
 # Build/CLI token（scope 含 grok-cli:access）必须走 cli-chat-proxy.grok.com，
 # 不能用默认 api.x.ai/v1（那是计费通道，会 402）。
-# headers 对齐 @xai-official/grok CLI / grok-build-auth（无 x-authenticateresponse）
+# headers 对齐健康号 / grok-register-new（grok-shell + x-compaction-at）
 CPA_TOKEN_ENDPOINT = f"{OIDC_ISSUER}/oauth2/token"
 CPA_GROK_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 CPA_GROK_HEADERS = {
     "User-Agent": GROK_TOKEN_UA,
     "X-XAI-Token-Auth": "xai-grok-cli",
     "x-authenticateresponse": "authenticate-response",
-    "x-grok-client-identifier": "grok-pager",
+    "x-compaction-at": "400000",
+    "x-grok-client-identifier": "grok-shell",
     "x-grok-client-version": GROK_VERSION,
+    "x-xai-token-auth": "xai-grok-cli",
 }
 CPA_PROBE_MODEL = "grok-4.5"
 CPA_PROBE_URL = f"{CPA_GROK_BASE_URL}/responses"
@@ -247,6 +252,38 @@ def _discover_action_ids_from_js(
     return ordered
 
 
+def _device_location_error(loc: str) -> str | None:
+    if not loc:
+        return None
+    try:
+        err = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("error", [None])[0]
+    except Exception:
+        return None
+    return err or None
+
+
+def _discover_device_endpoints(session, log=print) -> tuple[str, str] | None:
+    try:
+        resp = session.get(DISCOVERY_URL, impersonate="chrome", timeout=15)
+    except Exception as e:
+        log(f"  ❌ OIDC discovery 异常: {e}")
+        return None
+    if resp.status_code < 200 or resp.status_code >= 300:
+        log(f"  ❌ OIDC discovery HTTP {resp.status_code}")
+        return None
+    try:
+        doc = resp.json()
+    except Exception:
+        log("  ❌ OIDC discovery 非 JSON")
+        return None
+    device_ep = str(doc.get("device_authorization_endpoint") or "").strip()
+    token_ep = str(doc.get("token_endpoint") or CPA_TOKEN_ENDPOINT).strip()
+    if not device_ep or not token_ep:
+        log("  ❌ OIDC discovery 缺少 device/token endpoint")
+        return None
+    return device_ep, token_ep
+
+
 def sso_to_token(
     sso_cookie: str,
     proxy: str = "",
@@ -255,12 +292,11 @@ def sso_to_token(
 ) -> dict | None:
     """SSO cookie → token dict (access/refresh/expires_in)。
 
-    使用授权码流程（Authorization Code + PKCE）：
-    authorize 注入 referrer=grok-build + plan=generic，
-    consent 优先复用已成功的 Next-Action，失效时才扫描页面 JS 并重试。
+    使用 Device Authorization Flow（对齐 grok-register-new / 健康号）：
+    - scope 不含 conversations:*
+    - 不注入 referrer / plan
+    - 纯 HTTP：device verify + approve + poll token
     """
-    global _working_next_action_id
-
     stop_logged = False
 
     def _cancelled() -> bool:
@@ -278,7 +314,6 @@ def sso_to_token(
     s = requests.Session()
     if proxies:
         s.proxies = proxies
-    # accounts.x.ai / auth.x.ai 都要带 sso（与 grok-build 授权码流程一致）
     for domain in (".x.ai", "accounts.x.ai", "auth.x.ai"):
         s.cookies.set("sso", sso_cookie, domain=domain)
         s.cookies.set("sso-rw", sso_cookie, domain=domain)
@@ -295,215 +330,209 @@ def sso_to_token(
         return None
     log("  ✅ sso 有效")
 
-    verifier, challenge, state, nonce = _gen_pkce()
-
-    # 1) 打开 authorize 页，跟随重定向进入 consent
-    log(f"  🔑 Authorization Code Flow (referrer={GROK_REFERRER}, plan={GROK_PLAN})...")
-    authorize_params = urllib.parse.urlencode({
-        "client_id": CLIENT_ID,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "nonce": nonce,
-        "plan": GROK_PLAN,
-        "redirect_uri": REDIRECT_URI,
-        "referrer": GROK_REFERRER,
-        "response_type": "code",
-        "scope": SCOPES,
-        "state": state,
-    })
-    authorize_url = f"{OIDC_ISSUER}/oauth2/authorize?{authorize_params}"
-
-    def _open_consent(discover_actions=False):
-        if _cancelled():
-            return None, "", []
-        try:
-            resp = s.get(
-                authorize_url,
-                impersonate="chrome",
-                timeout=15,
-                allow_redirects=True,
-            )
-        except Exception as e:
-            log(f"  ❌ authorize 异常: {e}")
-            return None, "", []
-        url = str(resp.url)
-        if "sign-in" in url or "sign-up" in url:
-            log("  ❌ sso 无效")
-            return None, url, []
-        if "/oauth2/consent" not in url:
-            log(f"  ❌ authorize 未进入 consent: {url}")
-            return None, url, []
-        html = str(resp.text or "")
-        # consent 实际在 accounts.x.ai（从 auth.x.ai authorize 重定向）
-        base = "https://accounts.x.ai"
-        if "auth.x.ai" in url and "accounts.x.ai" not in url:
-            base = "https://auth.x.ai"
-        if discover_actions:
-            action_ids = _discover_action_ids_from_js(
-                s,
-                html,
-                base_url=base,
-                log=log,
-                should_stop=should_stop,
-            )
-        else:
-            action_ids = []
-            cached = str(_working_next_action_id or "").strip().lower()
-            if cached:
-                action_ids.append(cached)
-            for action_id in _extract_next_action_ids(html):
-                if action_id not in action_ids:
-                    action_ids.append(action_id)
-            log(f"  [*] consent 快速路径 Next-Action {len(action_ids)} 个（跳过 JS chunks 扫描）")
-        return resp, url, action_ids
-
-    r, final_url, action_ids = _open_consent()
-    if r is None:
+    endpoints = _discover_device_endpoints(s, log=log)
+    if not endpoints:
         return None
-    if not action_ids:
-        action_ids = [NEXT_ACTION_ID]
-        log(f"  ⚠️ 未解析到 Next-Action，使用 fallback {NEXT_ACTION_ID[:12]}...")
-    else:
-        log(f"  [*] consent Next-Action 候选 {len(action_ids)} 个（首个 {action_ids[0][:12]}...）")
-
-    # 2) 提交 consent（allow），拿 authorization code
-    # consent 也必须带 referrer=grok-build，否则 JWT claim 为 None
-    consent_payload = json.dumps([{
-        "action": "allow",
-        "clientId": CLIENT_ID,
-        "redirectUri": REDIRECT_URI,
-        "scope": SCOPES,
-        "state": state,
-        "codeChallenge": challenge,
-        "codeChallengeMethod": "S256",
-        "nonce": nonce,
-        "principalType": "User",
-        "principalId": "",
-        "referrer": GROK_REFERRER,
-    }])
-
-    code = None
-    last_err = ""
-    tried: set[str] = set()
-    # 最多 2 轮：第一轮优先试上次成功/内置 id；失败再重开 consent 扫 JS chunks。
-    for round_i in range(2):
-        if _cancelled():
-            return None
-        if round_i > 0:
-            log("  [*] consent 失败，重新进入 authorize/consent 并解析 Next-Action...")
-            r, final_url, action_ids = _open_consent(discover_actions=True)
-            if r is None:
-                return None
-            if not action_ids:
-                action_ids = [NEXT_ACTION_ID]
-
-        for action_id in action_ids[:8]:
-            if _cancelled():
-                return None
-            if action_id in tried:
-                continue
-            tried.add(action_id)
-            try:
-                r = s.post(
-                    final_url,
-                    data=consent_payload,
-                    headers={
-                        "Content-Type": "text/plain;charset=UTF-8",
-                        "Accept": "text/x-component",
-                        "Origin": "https://accounts.x.ai",
-                        "Referer": final_url,
-                        "Next-Action": action_id,
-                    },
-                    impersonate="chrome",
-                    timeout=15,
-                    allow_redirects=True,
-                )
-            except Exception as e:
-                last_err = f"consent 异常: {e}"
-                log(f"  ❌ {last_err}")
-                continue
-            body = str(r.text or "")
-            if r.status_code == 404 or "server action not found" in body.lower():
-                last_err = f"consent HTTP {r.status_code}: {body[:160]}"
-                log(f"  ⚠️ Next-Action {action_id[:12]}... 无效: {last_err}")
-                continue
-            if r.status_code < 200 or r.status_code >= 300:
-                last_err = f"consent HTTP {r.status_code}: {body[:200]}"
-                log(f"  ⚠️ {last_err}")
-                continue
-            code = _parse_consent_code(body)
-            if code:
-                _working_next_action_id = action_id
-                log(f"  [*] Next-Action {action_id[:12]}... 返回 authorization code")
-                break
-            # 200 但无 code：多半是别的 server action（如读用户信息），继续试
-            last_err = f"consent 未返回 code: {body[:180]}"
-            log(f"  ⚠️ Next-Action {action_id[:12]}... 非 allow 响应，继续试")
-        if code:
-            break
-
-    if not code:
-        log(f"  ❌ consent 失败（已试 {len(tried)} 个 Next-Action）: {last_err}")
-        return None
-    log("  ✅ 授权确认")
-
+    device_ep, token_ep = endpoints
     if _cancelled():
         return None
 
-    # 3) 用 authorization code 换 token
-    token_data = urllib.parse.urlencode({
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-        "client_id": CLIENT_ID,
-        "code_verifier": verifier,
-    })
+    log("  🔑 Device Authorization Flow（无 referrer / plan）...")
     try:
         r = s.post(
-            f"{OIDC_ISSUER}/oauth2/token",
-            data=token_data,
+            device_ep,
+            data=urllib.parse.urlencode({
+                "client_id": CLIENT_ID,
+                "scope": SCOPES,
+            }),
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": GROK_TOKEN_UA,
-                "X-Grok-Client-Version": GROK_VERSION,
-                "Accept": "*/*",
+                "User-Agent": BROWSER_UA,
+                "Accept": "application/json",
             },
             impersonate="chrome",
             timeout=15,
         )
     except Exception as e:
-        log(f"  ❌ token 异常: {e}")
+        log(f"  ❌ device authorization 异常: {e}")
+        return None
+    if r.status_code < 200 or r.status_code >= 300:
+        log(f"  ❌ device authorization HTTP {r.status_code}: {str(r.text)[:200]}")
+        return None
+    try:
+        device_doc = r.json()
+    except Exception:
+        log(f"  ❌ device authorization 非 JSON: {str(r.text)[:200]}")
+        return None
+
+    device_code = str(device_doc.get("device_code") or "").strip()
+    user_code = str(device_doc.get("user_code") or "").strip()
+    verification_uri = (
+        str(device_doc.get("verification_uri") or device_doc.get("verification_url") or "").strip()
+    )
+    verification_complete = str(device_doc.get("verification_uri_complete") or "").strip()
+    expires_in = int(device_doc.get("expires_in") or 600)
+    interval = float(device_doc.get("interval") or 5)
+    if interval < 1:
+        interval = 5
+    if not device_code or not user_code:
+        log(f"  ❌ device authorization 缺字段: {device_doc}")
+        return None
+    if not verification_complete:
+        base = verification_uri or "https://accounts.x.ai/oauth2/device"
+        sep = "&" if "?" in base else "?"
+        verification_complete = f"{base}{sep}user_code={urllib.parse.quote(user_code)}"
+    log(f"  [*] user_code={user_code} interval={interval}s")
+
+    # confirm: verify + approve（纯 HTTP，SSO cookie）
+    cookie_hdr = f"sso={sso_cookie}"
+    verify_headers = {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://accounts.x.ai",
+        "Referer": verification_complete,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cookie": cookie_hdr,
+    }
+    try:
+        r = s.post(
+            DEVICE_VERIFY_URL,
+            data=urllib.parse.urlencode({"user_code": user_code}),
+            headers=verify_headers,
+            impersonate="chrome",
+            timeout=15,
+            allow_redirects=False,
+        )
+    except Exception as e:
+        log(f"  ❌ device verify 异常: {e}")
         return None
     if _cancelled():
         return None
-    if r.status_code < 200 or r.status_code >= 300:
-        log(f"  ❌ token HTTP {r.status_code}: {str(r.text)[:200]}")
+    loc = str(r.headers.get("Location") or "")
+    loc_err = _device_location_error(loc)
+    if loc_err:
+        log(f"  ❌ device verify error={loc_err}")
         return None
-    try:
-        token = r.json()
-    except Exception:
-        log(f"  ❌ token 返回非 JSON: {str(r.text)[:200]}")
+    if r.status_code == 403:
+        log("  ❌ device verify challenge/403")
         return None
-    if not token.get("access_token"):
-        log(f"  ❌ token 缺少 access_token: {token}")
-        return None
-    if not token.get("expires_in"):
-        token["expires_in"] = 21600
-    if not token.get("token_type"):
-        token["token_type"] = "Bearer"
+    if "/oauth2/device/done" not in loc:
+        consent_ref = loc
+        if not consent_ref:
+            consent_ref = (
+                "https://accounts.x.ai/oauth2/device/consent?"
+                f"user_code={urllib.parse.quote(user_code)}"
+            )
+        elif consent_ref.startswith("/"):
+            consent_ref = "https://accounts.x.ai" + consent_ref
+        approve_headers = dict(verify_headers)
+        approve_headers["Referer"] = consent_ref
+        try:
+            r2 = s.post(
+                DEVICE_APPROVE_URL,
+                data=urllib.parse.urlencode({
+                    "user_code": user_code,
+                    "action": "allow",
+                    "principal_type": "User",
+                    "principal_id": "",
+                }),
+                headers=approve_headers,
+                impersonate="chrome",
+                timeout=15,
+                allow_redirects=False,
+            )
+        except Exception as e:
+            log(f"  ❌ device approve 异常: {e}")
+            return None
+        if _cancelled():
+            return None
+        aloc = str(r2.headers.get("Location") or "")
+        aerr = _device_location_error(aloc)
+        if aerr:
+            log(f"  ❌ device approve error={aerr}")
+            return None
+        body_l = str(r2.text or "").lower()
+        ok = (
+            "device authorized" in body_l
+            or "设备已授权" in (r2.text or "")
+            or r2.status_code // 100 == 2
+            or "device/done" in aloc
+            or (aloc and not aerr)
+        )
+        if not ok:
+            if r2.status_code == 403:
+                log("  ❌ device approve challenge/403")
+            else:
+                log(f"  ❌ device approve 未知响应 status={r2.status_code}")
+            return None
+    log("  ✅ 设备已授权")
 
-    # 校验 referrer claim（authorize 注入 cli-proxy-api 后应写入 JWT）
-    ap = decode_jwt_payload(token["access_token"])
-    ref = ap.get("referrer")
-    if ref not in (GROK_REFERRER, "grok-build", "cli-proxy-api"):
-        log(f"  ⚠️ access_token referrer={ref!r}（预期 {GROK_REFERRER!r} 或 grok-build）")
-    else:
-        log(f"  ✅ access_token referrer={ref!r}")
-    log(
-        f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
-        + (" + refresh_token" if token.get("refresh_token") else "")
-    )
-    return token
+    # poll token
+    deadline = time.time() + max(expires_in, 60)
+    poll_interval = interval
+    last_err = ""
+    while time.time() < deadline:
+        if _cancelled():
+            return None
+        try:
+            tr = s.post(
+                token_ep,
+                data=urllib.parse.urlencode({
+                    "client_id": CLIENT_ID,
+                    "device_code": device_code,
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                }),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": BROWSER_UA,
+                    "Accept": "application/json",
+                },
+                impersonate="chrome",
+                timeout=15,
+            )
+        except Exception as e:
+            last_err = f"token poll 异常: {e}"
+            log(f"  ⚠️ {last_err}")
+            time.sleep(poll_interval)
+            continue
+        try:
+            doc = tr.json()
+        except Exception:
+            last_err = f"token 非 JSON status={tr.status_code}"
+            time.sleep(poll_interval)
+            continue
+        if tr.status_code // 100 == 2 and doc.get("access_token"):
+            token = doc
+            if not token.get("expires_in"):
+                token["expires_in"] = 21600
+            if not token.get("token_type"):
+                token["token_type"] = "Bearer"
+            ap = decode_jwt_payload(token["access_token"])
+            log(
+                f"  ✅ access_token (expires_in={token.get('expires_in')}s)"
+                f" scope={ap.get('scope')!r} referrer={ap.get('referrer')!r}"
+                f" bot={ap.get('bot_flag_source')!r}"
+                + (" + refresh_token" if token.get("refresh_token") else "")
+            )
+            return token
+        err = str(doc.get("error") or "")
+        if err == "authorization_pending":
+            time.sleep(poll_interval)
+            continue
+        if err == "slow_down":
+            poll_interval += 1
+            time.sleep(poll_interval)
+            continue
+        if err in ("access_denied", "expired_token"):
+            log(f"  ❌ token poll {err}")
+            return None
+        last_err = err or f"status={tr.status_code}"
+        log(f"  ❌ token poll 失败: {last_err}")
+        return None
+
+    log(f"  ❌ token poll 超时: {last_err}")
+    return None
 
 
 def token_to_auth_entry(token: dict, email: str = "") -> tuple[str, dict]:
@@ -561,8 +590,8 @@ def _safe_email_for_filename(email: str) -> str:
 def token_to_cpa_record(token: dict, email: str = "", sso: str = "") -> dict:
     """token dict → CLIProxyAPI 扁平 xai auth 记录。
 
-    对齐 CPA internal/auth/xai/token.go 的 TokenStorage 字段，以及
-    grok-build-auth build_cliproxyapi_auth_record 的输出。
+    对齐 CPA internal/auth/xai/token.go 与 grok-register-new / 健康号输出：
+    无 redirect_uri、默认不写 sso 字段。
     """
     access = token.get("access_token") or token.get("key") or ""
     refresh = token.get("refresh_token") or ""
@@ -596,14 +625,13 @@ def token_to_cpa_record(token: dict, email: str = "", sso: str = "") -> dict:
         "expires_in": token.get("expires_in", None),
         "expired": expired,
         "last_refresh": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "redirect_uri": REDIRECT_URI,
         "token_endpoint": CPA_TOKEN_ENDPOINT,
         "base_url": CPA_GROK_BASE_URL,
-        "disabled": False,
         "headers": dict(CPA_GROK_HEADERS),
     }
+    # sso 仅在显式需要时写入；健康号 / new-register 不带此字段
     sso_val = str(sso or "").strip()
-    if sso_val:
+    if sso_val and os.environ.get("CPA_INCLUDE_SSO", "").strip() in ("1", "true", "yes"):
         record["sso"] = sso_val
     return record
 
@@ -622,34 +650,82 @@ def probe_cpa_record(
     proxy: str = "",
     timeout: int = 30,
     model: str = CPA_PROBE_MODEL,
+    warmup: bool = True,
+    retries: int = 3,
 ) -> tuple[int | None, str]:
-    """直连 CLI chat proxy 自测，返回 (HTTP 状态码, 响应摘要)。"""
+    """直连 CLI chat proxy 自测，返回 (HTTP 状态码, 响应摘要)。
+
+    对齐 grok-register-new Probe：新 token 常有瞬时 403，warmup + 重试。
+    """
     access = str(record.get("access_token") or "").strip()
     if not access:
         return None, "missing access_token"
 
-    headers = dict(record.get("headers") or {})
-    headers["Authorization"] = f"Bearer {access}"
-    headers["Content-Type"] = "application/json"
-    kwargs = {
-        "headers": headers,
-        "json": {
+    if warmup:
+        time.sleep(3)
+
+    last_code: int | None = None
+    last_summary = ""
+    sub = str(record.get("sub") or "").strip() or f"probe-{int(time.time() * 1000)}"
+    email = str(record.get("email") or "").strip()
+
+    for attempt in range(max(1, int(retries or 1))):
+        if attempt > 0:
+            time.sleep(4)
+        headers = dict(record.get("headers") or CPA_GROK_HEADERS)
+        headers["Authorization"] = f"Bearer {access}"
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "application/json"
+        rid = f"{int(time.time() * 1_000_000)}"
+        headers["x-grok-session-id"] = f"probe-{sub}"
+        headers["x-grok-conv-id"] = f"probe-{sub}"
+        headers["x-grok-req-id"] = rid
+        headers["x-grok-turn-idx"] = "1"
+        headers["x-grok-agent-id"] = f"agent-{rid[:8]}"
+        headers["x-grok-model-override"] = model
+        if email:
+            headers["x-email"] = email
+        if sub:
+            headers["x-userid"] = sub
+        # 对齐 new-register / acpa_watchdog 的 responses body
+        payload = {
             "model": model,
-            "input": "ping",
-            "max_output_tokens": 2,
+            "store": False,
             "stream": False,
-        },
-        "impersonate": "chrome",
-        "timeout": timeout,
-    }
-    if proxy:
-        kwargs["proxy"] = proxy
-    try:
-        resp = requests.post(CPA_PROBE_URL, **kwargs)
-        summary = str(resp.text or "").replace("\n", " ").strip()
-        return int(resp.status_code), summary[:300]
-    except Exception as exc:
-        return None, str(exc)[:300]
+            "max_output_tokens": 16,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ok"}],
+                }
+            ],
+        }
+        kwargs = {
+            "headers": headers,
+            "json": payload,
+            "impersonate": "chrome",
+            "timeout": timeout,
+        }
+        if proxy:
+            kwargs["proxy"] = proxy
+        try:
+            resp = requests.post(CPA_PROBE_URL, **kwargs)
+            summary = str(resp.text or "").replace("\n", " ").strip()
+            last_code, last_summary = int(resp.status_code), summary[:300]
+            if last_code == 200:
+                return last_code, last_summary
+            low = last_summary.lower()
+            if last_code == 403 and (
+                "permission-denied" in low
+                or "chat endpoint is denied" in low
+                or "denied" in low
+            ):
+                continue
+            return last_code, last_summary
+        except Exception as exc:
+            last_code, last_summary = None, str(exc)[:300]
+    return last_code, last_summary
 
 
 def write_cpa_auth(auth_dir: Path, record: dict) -> Path:
